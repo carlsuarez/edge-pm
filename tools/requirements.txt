@@ -1,0 +1,5 @@
+# edge-pm offline tooling. Install into a venv: python -m venv venv && pip install -r tools/requirements.txt
+numpy           # feature reference (verify_features.py), data packing (replay.py)
+scipy           # kurtosis, FFT, CWRU .mat loading (scipy.io.loadmat)
+torch           # model training + export (export_model.py) — only needed for export
+pyserial        # UART streaming to the board (replay.py uart) — Milestone E

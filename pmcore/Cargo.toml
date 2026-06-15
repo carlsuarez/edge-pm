@@ -1,0 +1,16 @@
+[package]
+name = "pmcore"
+description = "no_std portable core for edge-pm: feature extraction, 1-D CNN model, decision logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pmcore"
+path = "src/lib.rs"
+
+[dependencies]
+# The tiny-infer inference engine (no_std, alloc-free), checked out beside this repo.
+engine = { path = "../../tiny-infer/engine" }
+# Transcendental fns `core` lacks (sqrtf for RMS, etc.) — same crate the engine uses.
+libm = "0.2.16"

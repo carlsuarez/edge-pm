@@ -1,0 +1,27 @@
+# Milestone E placeholder — NOT built yet. This crate is excluded from the workspace
+# (see the root Cargo.toml) so the host build/test stay clean. The embassy + driver
+# dependencies below are the intended setup, left commented until Milestone E so the
+# manifest stays resolvable without pulling the (large, thumbv7em-only) embassy tree.
+#
+# Excluded crates cannot inherit `[workspace.package]`, so version/edition are explicit.
+[package]
+name = "firmware"
+description = "edge-pm firmware: ADXL345 acquisition + on-device 1-D CNN inference (STM32F411)"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "firmware"
+path = "src/main.rs"
+
+[dependencies]
+pmcore = { path = "../pmcore" }
+
+# --- Milestone E (uncomment + pin versions when the firmware shell is built) ---
+# cortex-m        = "0.7"
+# cortex-m-rt     = "0.7"
+# panic-halt      = "0.2"
+# embassy-executor = { version = "*", features = ["arch-cortex-m", "executor-thread"] }
+# embassy-stm32   = { version = "*", features = ["stm32f411re", "time-driver-any", "exti"] }
+# embassy-time    = "*"

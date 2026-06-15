@@ -1,0 +1,20 @@
+[workspace]
+members = ["pmcore", "host-sim"]
+# `firmware` is a no_std Cortex-M4F binary with its own compile target and linker
+# script, so it is excluded from the default workspace — `cargo build`/`test` at the
+# root stay host-native and fast. It is wired up in Milestone E and built explicitly
+# (`cargo build -p firmware --target thumbv7em-none-eabihf` from inside `firmware/`).
+exclude = ["firmware"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["edge-pm"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
