@@ -1,6 +1,6 @@
 /**/target
-/models          # exported model weights (*.bin)
-/data            # CWRU / recorded vibration datasets
+/models/
+/data
 /venv
 __pycache__/
 *.pyc

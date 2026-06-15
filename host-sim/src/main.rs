@@ -9,27 +9,39 @@
 //! host-sim                          print the pipeline configuration
 //! host-sim features <window.csv>    run Stage 2 — print the 9 features
 //! host-sim infer <model.bin> <csv>  run Stages 2+3 — print the class probabilities
+//! host-sim replay <model.bin> <csv> run all stages over a sample stream + alert FSM
 //! ```
 //!
-//! A window CSV is one `x,y,z` sample per row, [`WINDOW_LEN`] rows. The `features` and
+//! A window CSV is one `x,y,z` sample per row, [`WINDOW_LEN`] rows. A stream CSV is the same
+//! format but arbitrarily long — `replay` chops it into windows and drives the full Stage
+//! 1→4 pipeline (windowing → features → model → alert state machine). The `features` and
 //! `infer` outputs are directly comparable to `tools/verify_features.py` and
-//! `tools/export_model.py` on the same input — the Milestone B and C gates.
+//! `tools/export_model.py`; `replay` to `tools/make_stream.py` — the Milestone B/C/D gates.
 
 use std::process::ExitCode;
 
+use pmcore::alert::{AlertMachine, State, ALERT_CONFIDENCE};
 use pmcore::features::{extract, Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
 use pmcore::model::{Class, Model, N_CLASSES};
+use pmcore::pipeline::{process_window, Windower};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["features", window] => cmd_features(window),
         ["infer", model, window] => cmd_infer(model, window),
+        ["replay", model, stream] => cmd_replay(model, stream, ALERT_CONFIDENCE),
+        ["replay", model, stream, "--alert-confidence", c] => match c.parse::<f32>() {
+            Ok(conf) => cmd_replay(model, stream, conf),
+            Err(e) => Err(format!("--alert-confidence: {e}")),
+        },
         [] | ["-h"] | ["--help"] => {
             banner();
             return ExitCode::SUCCESS;
         }
-        _ => Err("usage: host-sim [features <window.csv> | infer <model.bin> <window.csv>]".into()),
+        _ => Err("usage: host-sim [features <window.csv> | infer <model.bin> <csv> | \
+                  replay <model.bin> <stream.csv> [--alert-confidence <f>]]"
+            .into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -74,6 +86,93 @@ fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
         probs[top]
     );
     Ok(())
+}
+
+/// All stages: chop a sample stream into windows and drive the full pipeline + alert FSM.
+fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<(), String> {
+    let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
+    let model = Model::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
+    let samples = parse_stream(stream_path)?;
+
+    let mut windower = Windower::new();
+    let mut alert = AlertMachine::with_confidence(confidence);
+    let mut scratch = vec![0.0f32; model.config().arena_floats()];
+
+    eprintln!(
+        "replay: {} samples, alert-confidence {:.2}",
+        samples.len(),
+        confidence
+    );
+    let mut windows = 0usize;
+    let mut alerts = 0usize;
+    let mut prev = State::Normal;
+
+    for s in &samples {
+        let Some(window) = windower.push(*s) else {
+            continue;
+        };
+        let out = process_window(&model, window, &mut scratch, &mut alert).map_err(|e| e.to_string())?;
+        println!(
+            "win {:>3}  {}  class={:<14} conf={:.4}  state={}",
+            windows,
+            join(&out.probs),
+            out.class.name(),
+            out.confidence,
+            fmt_state(out.state),
+        );
+        if out.state != prev {
+            eprintln!(
+                "  window {windows}: {} -> {}",
+                fmt_state(prev),
+                fmt_state(out.state)
+            );
+            if matches!(out.state, State::Alert { .. }) {
+                alerts += 1;
+            }
+        }
+        prev = out.state;
+        windows += 1;
+    }
+
+    let leftover = windower.fill_level();
+    eprintln!(
+        "replay done: {windows} windows, {alerts} alert(s) raised, final state {}, {leftover} trailing samples dropped",
+        fmt_state(prev)
+    );
+    Ok(())
+}
+
+/// Render an alert state for the human-readable log.
+fn fmt_state(s: State) -> String {
+    match s {
+        State::Normal => "NORMAL".to_string(),
+        State::Alert { class } => format!("ALERT:{}", class.name()),
+    }
+}
+
+/// Parse an arbitrarily long stream CSV (`x,y,z` per row) into a flat sample vector.
+fn parse_stream(path: &str) -> Result<Vec<Sample>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut samples = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut cols = line.split(',');
+        let mut s = [0i16; N_AXES];
+        for axis in s.iter_mut() {
+            let tok = cols
+                .next()
+                .ok_or_else(|| format!("line {}: expected {N_AXES} columns", n + 1))?;
+            *axis = tok
+                .trim()
+                .parse::<i16>()
+                .map_err(|e| format!("line {}: {e}", n + 1))?;
+        }
+        samples.push(s);
+    }
+    Ok(samples)
 }
 
 /// Parse a window CSV (`x,y,z` per row, [`WINDOW_LEN`] rows) into a sample array.
@@ -128,8 +227,12 @@ fn banner() {
     }
     eprintln!();
     eprintln!();
-    eprintln!("  host-sim features <window.csv>     Stage 2 — print the 9 features");
-    eprintln!("  host-sim infer <model.bin> <csv>   Stages 2+3 — print class probabilities");
+    eprintln!("  host-sim features <window.csv>      Stage 2 — print the 9 features");
+    eprintln!("  host-sim infer <model.bin> <csv>    Stages 2+3 — print class probabilities");
+    eprintln!("  host-sim replay <model.bin> <csv>   Stages 1-4 — windowing + alert state machine");
     eprintln!();
-    eprintln!("Decision logic (alert state machine) follows in Milestone D.");
+    eprintln!(
+        "  Alert: a fault class above {ALERT_CONFIDENCE:.2} latches ALERT; it clears after 3 consecutive"
+    );
+    eprintln!("  normal windows (hysteresis). Override the threshold with --alert-confidence <f>.");
 }

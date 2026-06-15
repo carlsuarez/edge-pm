@@ -165,7 +165,7 @@ pub enum ModelError {
     /// The weight region is not 4-byte aligned (cannot view it as `f32`). On a little-endian
     /// target with the model in aligned flash this never happens.
     Misaligned,
-    /// The `scratch` buffer handed to [`Model::infer`] is smaller than
+    /// The `scratch` buffer handed to [`Model::forward`] is smaller than
     /// [`ModelConfig::arena_floats`].
     ScratchTooSmall,
 }
