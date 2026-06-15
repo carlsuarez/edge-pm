@@ -14,3 +14,5 @@ path = "src/lib.rs"
 engine = { path = "../../tiny-infer/engine" }
 # Transcendental fns `core` lacks (sqrtf for RMS, etc.) — same crate the engine uses.
 libm = "0.2.16"
+# Safe byte→f32 reinterpretation of the model's weight region (no_std).
+bytemuck = "1"

@@ -1,8 +1,4 @@
-# pmcore depends on tiny-infer's `engine`, whose SIMD kernels use `core::simd` (the
-# nightly-only `portable_simd` feature), so the whole edge-pm workspace pins nightly —
-# the same channel tiny-infer pins. The thumbv7em target is here so the no_std check
-# (`cargo build -p pmcore --target thumbv7em-none-eabi`) works without a manual install.
 [toolchain]
-channel = "nightly"
+channel = "stable"
 components = ["clippy", "rustfmt"]
 targets = ["thumbv7em-none-eabi"]

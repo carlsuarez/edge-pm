@@ -41,7 +41,7 @@ edge-pm/
 This reshapes the original "everything under `firmware/`" sketch: the testable logic is
 pulled into `pmcore` so it isn't trapped behind a no_std/hardware binary. The engine ops
 (`conv1d`, `relu`, `global_avg_pool`) live upstream in `tiny-infer`'s `engine::nn`; the
-bearing-specific *model* lives here in `pmcore::model`.
+bearing-specific _model_ lives here in `pmcore::model`.
 
 ## Dependency on tiny-infer
 
@@ -67,16 +67,11 @@ cargo run -p host-sim                             # the replay harness
 
 ## Roadmap (host-first order)
 
-| # | Milestone | Where | Emulation |
-|---|-----------|-------|-----------|
-| A | CNN ops (`conv1d`/`relu`/`global_avg_pool`) | `tiny-infer` `engine::nn` | none — **done** |
-| B | Feature extraction (RMS, crest, kurtosis, FFT) | `pmcore::features` | none (vs `tools/verify_features.py`) |
-| C | Model format + loader + forward pass | `pmcore::model` | none (vs laptop inference) |
-| D | Pipeline + decision state machine | `pmcore::{pipeline,alert}` | none (replay CWRU windows) |
-| E | Firmware: embassy, SPI/DMA bring-up, real-time loop | `firmware/` | **Renode** |
-| F | Int8 weight quantization (stretch) | reuse `engine::quant` | none |
-
-## Out of scope
-
-Cloud connectivity, OTA, RTOS, dynamic allocation, model *training* (done offline),
-multi-sensor fusion, display output.
+| #   | Milestone                                           | Where                      | Emulation                            |
+| --- | --------------------------------------------------- | -------------------------- | ------------------------------------ |
+| A   | CNN ops (`conv1d`/`relu`/`global_avg_pool`)         | `tiny-infer` `engine::nn`  | none — **done**                      |
+| B   | Feature extraction (RMS, crest, kurtosis, FFT)      | `pmcore::features`         | none (vs `tools/verify_features.py`) |
+| C   | Model format + loader + forward pass                | `pmcore::model`            | none (vs laptop inference)           |
+| D   | Pipeline + decision state machine                   | `pmcore::{pipeline,alert}` | none (replay CWRU windows)           |
+| E   | Firmware: embassy, SPI/DMA bring-up, real-time loop | `firmware/`                | **Renode**                           |
+| F   | Int8 weight quantization (stretch)                  | reuse `engine::quant`      | none                                 |
