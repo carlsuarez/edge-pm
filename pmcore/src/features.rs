@@ -38,7 +38,7 @@ pub type Sample = [i16; N_AXES];
 /// reused across axes.
 pub fn extract(window: &[Sample; WINDOW_LEN], out: &mut [f32; FEATURE_LEN]) {
     for (i, chunk) in out.chunks_exact_mut(FEATURES_PER_AXIS).enumerate() {
-        let col: [i16; WINDOW_LEN] = core::array::from_fn(|j| window[j][i]);
+        let col: [i16; WINDOW_LEN] = window.map(|row| row[i]);
         chunk[0] = rms(&col);
         chunk[1] = crest(&col);
         chunk[2] = kurtosis(&col);
