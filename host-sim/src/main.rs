@@ -22,8 +22,9 @@ use std::process::ExitCode;
 
 use pmcore::alert::{AlertMachine, State, ALERT_CONFIDENCE};
 use pmcore::features::{extract, Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
-use pmcore::model::{Class, Model, N_CLASSES};
+use pmcore::model::{Class, Weights, N_CLASSES};
 use pmcore::pipeline::{process_window, Windower};
+use pmcore::{Arena, RunState};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,9 +40,11 @@ fn main() -> ExitCode {
             banner();
             return ExitCode::SUCCESS;
         }
-        _ => Err("usage: host-sim [features <window.csv> | infer <model.bin> <csv> | \
+        _ => Err(
+            "usage: host-sim [features <window.csv> | infer <model.bin> <csv> | \
                   replay <model.bin> <stream.csv> [--alert-confidence <f>]]"
-            .into()),
+                .into(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -64,26 +67,25 @@ fn cmd_features(window_path: &str) -> Result<(), String> {
 /// Stages 2+3: extract features, run the model, print the class probabilities.
 fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
-    let model = Model::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
+    let (config, weights) = Weights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
 
     let window = parse_window(window_path)?;
-    let mut feats = [0.0f32; FEATURE_LEN];
-    extract(&window, &mut feats);
 
-    let mut scratch = vec![0.0f32; model.config().arena_floats()];
-    let mut probs = [0.0f32; N_CLASSES];
-    model
-        .forward(&window, &feats, &mut scratch, &mut probs)
-        .map_err(|e| e.to_string())?;
+    // Carve the run state once, exactly as the firmware does at startup.
+    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut arena = Arena::new(&mut scratch);
+    let mut state = RunState::new(&mut arena, &config).map_err(|e| format!("{e:?}"))?;
 
-    let top = (0..N_CLASSES)
-        .max_by(|&a, &b| probs[a].total_cmp(&probs[b]))
-        .unwrap();
-    println!("{}", join(&probs));
+    // Reuse the shared per-window step; the alert machine is a throwaway here (this command
+    // reports a single window's probabilities, not a running alert state).
+    let mut alert = AlertMachine::new();
+    let out = process_window(&config, &weights, &window, &mut state, &mut alert);
+
+    println!("{}", join(&out.probs));
     eprintln!(
         "class={} confidence={:.4}",
-        Class::from_index(top).unwrap().name(),
-        probs[top]
+        out.class.name(),
+        out.confidence
     );
     Ok(())
 }
@@ -91,12 +93,17 @@ fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
 /// All stages: chop a sample stream into windows and drive the full pipeline + alert FSM.
 fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<(), String> {
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
-    let model = Model::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
+    let (config, weights) = Weights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
     let samples = parse_stream(stream_path)?;
 
     let mut windower = Windower::new();
     let mut alert = AlertMachine::with_confidence(confidence);
-    let mut scratch = vec![0.0f32; model.config().arena_floats()];
+
+    // Carve the run state once up front; every window reuses it (no per-window allocation),
+    // mirroring how the firmware sets up its static arena at boot and loops forever.
+    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut arena = Arena::new(&mut scratch);
+    let mut state = RunState::new(&mut arena, &config).map_err(|e| format!("{e:?}"))?;
 
     eprintln!(
         "replay: {} samples, alert-confidence {:.2}",
@@ -111,7 +118,7 @@ fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<()
         let Some(window) = windower.push(*s) else {
             continue;
         };
-        let out = process_window(&model, window, &mut scratch, &mut alert).map_err(|e| e.to_string())?;
+        let out = process_window(&config, &weights, window, &mut state, &mut alert);
         println!(
             "win {:>3}  {}  class={:<14} conf={:.4}  state={}",
             windows,

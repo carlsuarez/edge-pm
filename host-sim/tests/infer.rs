@@ -11,8 +11,11 @@
 
 use std::path::PathBuf;
 
+use pmcore::alert::AlertMachine;
 use pmcore::features::{extract, FEATURE_LEN, N_AXES, WINDOW_LEN};
-use pmcore::model::{Model, N_CLASSES};
+use pmcore::model::{Weights, N_CLASSES};
+use pmcore::pipeline::process_window;
+use pmcore::{Arena, RunState};
 
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -41,7 +44,7 @@ fn forward_pass_matches_pytorch_reference() {
 
     // Load the model.
     let bytes = std::fs::read(&model_p).unwrap();
-    let model = Model::load(&bytes).expect("model loads");
+    let (config, weights) = Weights::load(&bytes).expect("model loads");
 
     // Parse the window CSV into a sample array.
     let text = std::fs::read_to_string(&window_p).unwrap();
@@ -79,11 +82,11 @@ fn forward_pass_matches_pytorch_reference() {
         );
     }
 
-    let mut scratch = vec![0.0f32; model.config().arena_floats()];
-    let mut probs = [0.0f32; N_CLASSES];
-    model
-        .forward(&window, &feats, &mut scratch, &mut probs)
-        .unwrap();
+    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut arena = Arena::new(&mut scratch);
+    let mut state = RunState::new(&mut arena, &config).unwrap();
+    let mut alert = AlertMachine::new();
+    let probs = process_window(&config, &weights, &window, &mut state, &mut alert).probs;
 
     // End-to-end: pmcore probs vs PyTorch probs.
     let mut max_abs = 0.0f32;

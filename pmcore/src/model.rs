@@ -17,7 +17,14 @@
 //! and the dense head learns to weigh both. It also ties the pipeline together — Stage 2's
 //! output is not just logged, it feeds the classifier.
 //!
-//! # Forward pass (built on [`engine::nn`] + [`engine::math`])
+//! # The three pieces (mirroring tiny-infer)
+//!
+//! Loading and running a model is split into three things that **own each other not at
+//! all**: a [`ModelConfig`] of layer dimensions (with the sizing helpers), a [`Weights`]
+//! bundle of zero-copy `f32` views into the checkpoint, and a [`RunState`] of activation
+//! buffers carved from an [`engine::Arena`]. The forward pass is the free function
+//! [`forward`], handed all three. Sizing, weights, and scratch are therefore independent
+//! and individually testable.
 //!
 //! ```text
 //! window[N_AXES, WINDOW_LEN]
@@ -26,11 +33,8 @@
 //!   → global_avg_pool      [c2]
 //!   → concat features      [c2 + FEATURE_LEN]
 //!   → dense (matmul+bias)  [N_CLASSES]
-//!   → softmax              [N_CLASSES]
+//!   → softmax              [N_CLASSES]   (probabilities over the four classes)
 //! ```
-//!
-//! Every working buffer is carved once from a caller-provided [`engine::Arena`] sized by
-//! [`ModelConfig::arena_floats`]; the forward pass allocates nothing.
 //!
 //! # On-disk format
 //!
@@ -39,9 +43,10 @@
 //! as tiny-infer's checkpoints. See `tools/export_model.py`.
 
 use engine::nn::conv1d_out_len;
-use engine::{math, nn, Arena};
+use engine::{math, nn};
 
 use crate::features::{Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
+use crate::RunState;
 
 /// Number of bearing-health classes the model discriminates.
 pub const N_CLASSES: usize = 4;
@@ -99,6 +104,9 @@ impl Class {
 /// Dimensions of the two convolutional layers (everything else is fixed by the pipeline:
 /// `N_AXES` input channels, `WINDOW_LEN` input samples, `FEATURE_LEN` fused features,
 /// `N_CLASSES` outputs).
+///
+/// A plain `Copy` value object: it owns no weights and no buffers, just the arithmetic
+/// needed to size them ([`l1`](Self::l1) / [`l2`](Self::l2) / [`arena_floats`](Self::arena_floats)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelConfig {
     /// conv1 output channels.
@@ -141,6 +149,44 @@ impl ModelConfig {
             + self.c2 * self.c1 * self.k2 + self.c2     // conv2 weight + bias
             + N_CLASSES * (self.c2 + FEATURE_LEN) + N_CLASSES // dense weight + bias
     }
+
+    /// Parse and validate the 64-byte header, returning just the layer dimensions.
+    ///
+    /// Checks the `"epm1"` magic, the version, and that the fixed dimensions (input
+    /// channels / window / features / classes) match the compiled pipeline. It does *not*
+    /// look at the weight payload — [`Weights::load`] does the size and alignment checks.
+    ///
+    /// # Errors
+    /// [`ModelError::TooShort`], [`ModelError::BadMagic`], [`ModelError::UnsupportedVersion`],
+    /// or [`ModelError::ConfigMismatch`].
+    pub fn parse(bytes: &[u8]) -> Result<ModelConfig, ModelError> {
+        if bytes.len() < HEADER_BYTES {
+            return Err(ModelError::TooShort);
+        }
+        if bytes[..4] != MAGIC {
+            return Err(ModelError::BadMagic);
+        }
+        let version = rd_i32(bytes, 4);
+        if version != VERSION {
+            return Err(ModelError::UnsupportedVersion(version));
+        }
+        // Fixed dimensions must match the compiled pipeline.
+        if rd_i32(bytes, 8) as usize != N_AXES
+            || rd_i32(bytes, 12) as usize != WINDOW_LEN
+            || rd_i32(bytes, 40) as usize != FEATURE_LEN
+            || rd_i32(bytes, 44) as usize != N_CLASSES
+        {
+            return Err(ModelError::ConfigMismatch);
+        }
+        Ok(ModelConfig {
+            c1: rd_i32(bytes, 16) as usize,
+            k1: rd_i32(bytes, 20) as usize,
+            s1: rd_i32(bytes, 24) as usize,
+            c2: rd_i32(bytes, 28) as usize,
+            k2: rd_i32(bytes, 32) as usize,
+            s2: rd_i32(bytes, 36) as usize,
+        })
+    }
 }
 
 /// Why loading a model failed.
@@ -165,9 +211,6 @@ pub enum ModelError {
     /// The weight region is not 4-byte aligned (cannot view it as `f32`). On a little-endian
     /// target with the model in aligned flash this never happens.
     Misaligned,
-    /// The `scratch` buffer handed to [`Model::forward`] is smaller than
-    /// [`ModelConfig::arena_floats`].
-    ScratchTooSmall,
 }
 
 impl core::fmt::Display for ModelError {
@@ -186,72 +229,51 @@ impl core::fmt::Display for ModelError {
                 )
             }
             ModelError::Misaligned => write!(f, "model weight region is not 4-byte aligned"),
-            ModelError::ScratchTooSmall => write!(f, "inference scratch buffer is too small"),
         }
     }
 }
 
-/// A loaded model: the config plus zero-copy views of each weight tensor.
+/// Zero-copy views of each weight tensor in a loaded model.
+///
+/// Like tiny-infer's `Weights`, every field borrows a sub-slice straight out of the
+/// checkpoint's `f32` region — nothing is copied or reshaped. Holds no [`ModelConfig`]; the
+/// config is parsed alongside it (see [`Weights::load`]) and passed to [`forward`]
+/// separately.
 #[derive(Clone, Copy, Debug)]
-pub struct Model<'w> {
-    config: ModelConfig,
-    conv1_w: &'w [f32],
-    conv1_b: &'w [f32],
-    conv2_w: &'w [f32],
-    conv2_b: &'w [f32],
-    fc_w: &'w [f32],
-    fc_b: &'w [f32],
+pub struct Weights<'w> {
+    /// conv1 weight, `[c1, N_AXES, k1]`.
+    pub conv1_w: &'w [f32],
+    /// conv1 bias, `[c1]`.
+    pub conv1_b: &'w [f32],
+    /// conv2 weight, `[c2, c1, k2]`.
+    pub conv2_w: &'w [f32],
+    /// conv2 bias, `[c2]`.
+    pub conv2_b: &'w [f32],
+    /// dense weight, `[N_CLASSES, c2 + FEATURE_LEN]`.
+    pub fc_w: &'w [f32],
+    /// dense bias, `[N_CLASSES]`.
+    pub fc_b: &'w [f32],
 }
 
-impl<'w> Model<'w> {
-    /// Parse a model from its on-disk bytes (header + weights), validating magic, version,
-    /// the fixed dimensions, and the file size, then slicing each weight tensor in place.
+impl<'w> Weights<'w> {
+    /// Carve the six weight tensors out of the checkpoint's `f32` region — the bytes after
+    /// the 64-byte header, reinterpreted as `f32` — in declaration (PyTorch) order.
     ///
-    /// `bytes` must be 4-byte aligned (the model in flash is; on the host, read into an
-    /// aligned buffer). Little-endian, matching the export and both target CPUs.
-    pub fn load(bytes: &'w [u8]) -> Result<Model<'w>, ModelError> {
-        if bytes.len() < HEADER_BYTES {
-            return Err(ModelError::TooShort);
-        }
-        if bytes[..4] != MAGIC {
-            return Err(ModelError::BadMagic);
-        }
-        let version = rd_i32(bytes, 4);
-        if version != VERSION {
-            return Err(ModelError::UnsupportedVersion(version));
-        }
-        // Fixed dimensions must match the compiled pipeline.
-        if rd_i32(bytes, 8) as usize != N_AXES
-            || rd_i32(bytes, 12) as usize != WINDOW_LEN
-            || rd_i32(bytes, 40) as usize != FEATURE_LEN
-            || rd_i32(bytes, 44) as usize != N_CLASSES
-        {
-            return Err(ModelError::ConfigMismatch);
-        }
-        let config = ModelConfig {
-            c1: rd_i32(bytes, 16) as usize,
-            k1: rd_i32(bytes, 20) as usize,
-            s1: rd_i32(bytes, 24) as usize,
-            c2: rd_i32(bytes, 28) as usize,
-            k2: rd_i32(bytes, 32) as usize,
-            s2: rd_i32(bytes, 36) as usize,
-        };
-
-        let expected = HEADER_BYTES + config.weight_floats() * 4;
-        if bytes.len() != expected {
+    /// # Errors
+    /// [`ModelError::SizeMismatch`] if `floats` is shorter than `config` requires.
+    pub fn new(floats: &'w [f32], config: &ModelConfig) -> Result<Weights<'w>, ModelError> {
+        let needed = config.weight_floats();
+        if floats.len() < needed {
             return Err(ModelError::SizeMismatch {
-                expected,
-                got: bytes.len(),
+                expected: needed * 4,
+                got: core::mem::size_of_val(floats),
             });
         }
 
-        let weights: &[f32] =
-            bytemuck::try_cast_slice(&bytes[HEADER_BYTES..]).map_err(|_| ModelError::Misaligned)?;
-
-        // Slice the tensors in declaration order.
+        // Bump a cursor through the slice, taking each tensor in declaration order.
         let mut o = 0;
         let mut take = |n: usize| {
-            let s = &weights[o..o + n];
+            let s = &floats[o..o + n];
             o += n;
             s
         };
@@ -262,8 +284,7 @@ impl<'w> Model<'w> {
         let fc_w = take(N_CLASSES * (config.c2 + FEATURE_LEN));
         let fc_b = take(N_CLASSES);
 
-        Ok(Model {
-            config,
+        Ok(Weights {
             conv1_w,
             conv1_b,
             conv2_w,
@@ -273,91 +294,28 @@ impl<'w> Model<'w> {
         })
     }
 
-    /// The model's layer dimensions.
-    pub fn config(&self) -> ModelConfig {
-        self.config
-    }
-
-    /// Run the forward pass: classify one window + its features into `probs` (a softmax over
-    /// the four [`Class`]es). `scratch` must hold at least [`ModelConfig::arena_floats`]
-    /// elements; every working buffer is carved from it and nothing else allocates.
+    /// Parse a model from its on-disk bytes (header + weights): validate the header via
+    /// [`ModelConfig::parse`], check the exact file size and 4-byte alignment, then slice
+    /// each weight tensor in place. Returns the config and the views side by side — neither
+    /// owns the other.
     ///
-    /// # Errors
-    /// [`ModelError::ScratchTooSmall`] if `scratch` is shorter than the arena budget.
-    pub fn forward(
-        &self,
-        window: &[Sample; WINDOW_LEN],
-        features: &[f32; FEATURE_LEN],
-        scratch: &mut [f32],
-        probs: &mut [f32; N_CLASSES],
-    ) -> Result<(), ModelError> {
-        let c = &self.config;
-        let (l1, l2) = (c.l1(), c.l2());
+    /// `bytes` must be 4-byte aligned (the model in flash is; on the host, read into an
+    /// aligned buffer). Little-endian, matching the export and both target CPUs.
+    pub fn load(bytes: &'w [u8]) -> Result<(ModelConfig, Weights<'w>), ModelError> {
+        let config = ModelConfig::parse(bytes)?;
 
-        let mut arena = Arena::new(scratch);
-
-        // De-interleave the window into channel-major f32 `[N_AXES, WINDOW_LEN]`.
-        let input = arena
-            .alloc(N_AXES * WINDOW_LEN)
-            .map_err(|_| ModelError::ScratchTooSmall)?;
-        for ch in 0..N_AXES {
-            let row = &mut input[ch * WINDOW_LEN..][..WINDOW_LEN];
-            for (slot, sample) in row.iter_mut().zip(window.iter()) {
-                *slot = sample[ch] as f32;
-            }
+        let expected = HEADER_BYTES + config.weight_floats() * 4;
+        if bytes.len() != expected {
+            return Err(ModelError::SizeMismatch {
+                expected,
+                got: bytes.len(),
+            });
         }
 
-        // conv1 → relu
-        let a = arena
-            .alloc(c.c1 * l1)
-            .map_err(|_| ModelError::ScratchTooSmall)?;
-        nn::conv1d(
-            a,
-            input,
-            self.conv1_w,
-            Some(self.conv1_b),
-            N_AXES,
-            c.c1,
-            WINDOW_LEN,
-            c.k1,
-            c.s1,
-        );
-        nn::relu(a);
-
-        // conv2 → relu
-        let b = arena
-            .alloc(c.c2 * l2)
-            .map_err(|_| ModelError::ScratchTooSmall)?;
-        nn::conv1d(
-            b,
-            a,
-            self.conv2_w,
-            Some(self.conv2_b),
-            c.c1,
-            c.c2,
-            l1,
-            c.k2,
-            c.s2,
-        );
-        nn::relu(b);
-
-        // global average pool → concat the fused features
-        let cat = arena
-            .alloc(c.c2 + FEATURE_LEN)
-            .map_err(|_| ModelError::ScratchTooSmall)?;
-        nn::global_avg_pool(&mut cat[..c.c2], b, c.c2, l2);
-        cat[c.c2..].copy_from_slice(features);
-
-        // dense + bias → softmax
-        let logits = arena
-            .alloc(N_CLASSES)
-            .map_err(|_| ModelError::ScratchTooSmall)?;
-        math::matmul(logits, cat, self.fc_w, c.c2 + FEATURE_LEN, N_CLASSES);
-        math::add_bias(logits, self.fc_b);
-        math::softmax(logits);
-
-        probs.copy_from_slice(logits);
-        Ok(())
+        let floats: &[f32] =
+            bytemuck::try_cast_slice(&bytes[HEADER_BYTES..]).map_err(|_| ModelError::Misaligned)?;
+        let weights = Weights::new(floats, &config)?;
+        Ok((config, weights))
     }
 }
 
@@ -366,11 +324,74 @@ fn rd_i32(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// Run the forward pass: classify `window` + its `features` into the class **probabilities**
+/// (a softmax over the four [`Class`]es), written into [`state.logits`](RunState::logits).
+///
+/// Computes the result from the three independent pieces — the [`ModelConfig`], the
+/// [`Weights`], and the [`RunState`] scratch — touching no memory beyond `state`'s
+/// arena-carved buffers, so it allocates nothing and is infallible. The buffer is named
+/// `logits` for the dense output it holds mid-pass; after the closing softmax it holds the
+/// normalized probabilities.
+pub fn forward(
+    config: &ModelConfig,
+    weights: &Weights,
+    state: &mut RunState,
+    window: &[Sample; WINDOW_LEN],
+    features: &[f32; FEATURE_LEN],
+) {
+    state.x_from_window(window);
+
+    // conv1 → relu
+    nn::conv1d(
+        state.x_c1,
+        state.x,
+        weights.conv1_w,
+        Some(weights.conv1_b),
+        N_AXES,
+        config.c1,
+        WINDOW_LEN,
+        config.k1,
+        config.s1,
+    );
+    nn::relu(state.x_c1);
+
+    // conv2 → relu
+    nn::conv1d(
+        state.x_c2,
+        state.x_c1,
+        weights.conv2_w,
+        Some(weights.conv2_b),
+        config.c1,
+        config.c2,
+        config.l1(),
+        config.k2,
+        config.s2,
+    );
+    nn::relu(state.x_c2);
+
+    // global average pool → concat the fused features
+    let (pooled, feat_tail) = state.glb_avg_pool.split_at_mut(config.c2);
+    nn::global_avg_pool(pooled, state.x_c2, config.c2, config.l2());
+    feat_tail.copy_from_slice(features);
+
+    // dense + bias → logits → softmax
+    math::matmul(
+        state.logits,
+        state.glb_avg_pool,
+        weights.fc_w,
+        config.c2 + FEATURE_LEN,
+        N_CLASSES,
+    );
+    math::add_bias(state.logits, weights.fc_b);
+    math::softmax(state.logits);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     extern crate std;
+    use engine::Arena;
     use std::vec;
     use std::vec::Vec;
 
@@ -401,6 +422,23 @@ mod tests {
             b.extend_from_slice(&w.to_le_bytes());
         }
         b
+    }
+
+    // Run the full forward pass over a freshly-carved arena, returning the probabilities
+    // (forward applies the closing softmax itself).
+    fn run(
+        cfg: &ModelConfig,
+        w: &Weights,
+        window: &[Sample; WINDOW_LEN],
+        feats: &[f32; FEATURE_LEN],
+    ) -> [f32; N_CLASSES] {
+        let mut scratch = vec![0.0f32; cfg.arena_floats()];
+        let mut arena = Arena::new(&mut scratch);
+        let mut state = RunState::new(&mut arena, cfg).unwrap();
+        forward(cfg, w, &mut state, window, feats);
+        let mut probs = [0.0f32; N_CLASSES];
+        probs.copy_from_slice(state.logits);
+        probs
     }
 
     #[test]
@@ -444,13 +482,37 @@ mod tests {
 
         let mut bad = blob.clone();
         bad[0] = b'X';
-        assert_eq!(Model::load(&bad).err(), Some(ModelError::BadMagic));
+        assert_eq!(Weights::load(&bad).err(), Some(ModelError::BadMagic));
 
         let truncated = &blob[..blob.len() - 4];
         assert!(matches!(
-            Model::load(truncated),
+            Weights::load(truncated),
             Err(ModelError::SizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn load_returns_config_and_views_that_partition_the_payload() {
+        let cfg = ModelConfig {
+            c1: 2,
+            k1: 3,
+            s1: 1,
+            c2: 2,
+            k2: 3,
+            s2: 1,
+        };
+        // Fill the weights with their own index so each view reveals where it was carved.
+        let w: Vec<f32> = (0..cfg.weight_floats()).map(|i| i as f32).collect();
+        let blob = build_blob(&cfg, &w);
+        let (parsed, views) = Weights::load(&blob).unwrap();
+
+        assert_eq!(parsed, cfg);
+        assert_eq!(views.conv1_w.len(), cfg.c1 * N_AXES * cfg.k1);
+        assert_eq!(views.conv1_w[0], 0.0);
+        assert_eq!(views.conv1_b[0], (cfg.c1 * N_AXES * cfg.k1) as f32);
+        assert_eq!(views.fc_b.len(), N_CLASSES);
+        // The last tensor ends exactly at the payload end.
+        assert_eq!(views.fc_b[N_CLASSES - 1], (cfg.weight_floats() - 1) as f32);
     }
 
     #[test]
@@ -472,15 +534,11 @@ mod tests {
         let n = w.len();
         w[n - N_CLASSES..].copy_from_slice(&[0.0, core::f32::consts::LN_2, 0.0, 0.0]);
         let blob = build_blob(&cfg, &w);
-        let model = Model::load(&blob).unwrap();
+        let (config, weights) = Weights::load(&blob).unwrap();
 
         let window = [[123i16, -7, 9]; WINDOW_LEN]; // arbitrary — output must ignore it
         let feats = [1.0f32; FEATURE_LEN];
-        let mut scratch = vec![0.0f32; cfg.arena_floats()];
-        let mut probs = [0.0f32; N_CLASSES];
-        model
-            .forward(&window, &feats, &mut scratch, &mut probs)
-            .unwrap();
+        let probs = run(&config, &weights, &window, &feats);
 
         // softmax([0, ln2, 0, 0]) = [1, 2, 1, 1] / 5
         assert!(close(probs[0], 0.2));
@@ -504,16 +562,12 @@ mod tests {
             .map(|i| ((i as f32 * 0.123).sin()) * 0.05)
             .collect();
         let blob = build_blob(&cfg, &w);
-        let model = Model::load(&blob).unwrap();
+        let (config, weights) = Weights::load(&blob).unwrap();
 
         let window: [Sample; WINDOW_LEN] =
             core::array::from_fn(|t| [(t as i16 % 50) - 25, 10, -((t as i16) % 7)]);
         let feats = [0.5f32; FEATURE_LEN];
-        let mut scratch = vec![0.0f32; cfg.arena_floats()];
-        let mut probs = [0.0f32; N_CLASSES];
-        model
-            .forward(&window, &feats, &mut scratch, &mut probs)
-            .unwrap();
+        let probs = run(&config, &weights, &window, &feats);
 
         let sum: f32 = probs.iter().sum();
         assert!(close(sum, 1.0), "probs sum to {sum}");

@@ -14,7 +14,8 @@
 
 use crate::alert::{top_class, AlertMachine, State};
 use crate::features::{self, Sample, FEATURE_LEN, WINDOW_LEN, N_AXES};
-use crate::model::{Class, Model, ModelError, N_CLASSES};
+use crate::model::{forward, Class, ModelConfig, Weights, N_CLASSES};
+use crate::RunState;
 
 /// Double-buffered windower over a 3-axis sample stream.
 ///
@@ -92,33 +93,36 @@ pub struct Outcome {
 /// Run one completed window through every stage: extract features, run the model forward
 /// pass, and advance the alert state machine.
 ///
-/// `scratch` is the model's working buffer (size [`ModelConfig::arena_floats`]); it is the
-/// only memory this touches beyond the stack, so the call is allocation-free and identical
-/// on host and device.
-///
-/// [`ModelConfig::arena_floats`]: crate::model::ModelConfig::arena_floats
+/// This is the **steady-state loop body** — on-device it is called once per window for the
+/// life of the program. It allocates nothing and reuses the caller-owned working set: the
+/// [`Weights`] and the [`RunState`] (whose arena is carved exactly once at startup by
+/// [`RunState::new`], *not* here) are borrowed, never built. `state.logits` is overwritten
+/// each call. Identical on host and device.
 pub fn process_window(
-    model: &Model,
+    config: &ModelConfig,
+    weights: &Weights,
     window: &[Sample; WINDOW_LEN],
-    scratch: &mut [f32],
+    state: &mut RunState,
     alert: &mut AlertMachine,
-) -> Result<Outcome, ModelError> {
+) -> Outcome {
     let mut feats = [0.0f32; FEATURE_LEN];
     features::extract(window, &mut feats);
 
-    let mut probs = [0.0f32; N_CLASSES];
-    model.forward(window, &feats, scratch, &mut probs)?;
+    forward(config, weights, state, window, &feats);
 
-    let state = alert.update(&probs);
+    let mut probs = [0.0f32; N_CLASSES];
+    probs.copy_from_slice(state.logits);
+
+    let alert_state = alert.update(&probs);
     let (class, confidence) = top_class(&probs);
 
-    Ok(Outcome {
+    Outcome {
         features: feats,
         probs,
         class,
         confidence,
-        state,
-    })
+        state: alert_state,
+    }
 }
 
 #[cfg(test)]

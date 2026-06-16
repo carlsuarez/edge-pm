@@ -37,10 +37,10 @@ pub enum State {
 /// exceed 0.5 — and thus the [`ALERT_CONFIDENCE`] = 0.80 threshold — making "the dominant
 /// class" and "the class that crosses the threshold" the same question.
 pub fn top_class(probs: &[f32; N_CLASSES]) -> (Class, f32) {
-    let idx = engine::math::argmax(probs);
+    let (idx, max_val) = engine::math::argmax(probs);
     // `argmax` returns `0..N_CLASSES`, which `from_index` covers exactly; `Normal` is an
     // unreachable fallback that keeps this panic-free.
-    (Class::from_index(idx).unwrap_or(Class::Normal), probs[idx])
+    (Class::from_index(idx).unwrap_or(Class::Normal), max_val)
 }
 
 /// The `NORMAL ⇄ ALERT` decision state machine with clear-side hysteresis.

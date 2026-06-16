@@ -16,8 +16,9 @@ use std::path::PathBuf;
 
 use pmcore::alert::{AlertMachine, State};
 use pmcore::features::{Sample, N_AXES};
-use pmcore::model::{Class, Model, N_CLASSES};
+use pmcore::model::{Class, Weights, N_CLASSES};
 use pmcore::pipeline::{process_window, Windower};
+use pmcore::{Arena, RunState};
 
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,7 +46,7 @@ fn replay_matches_reference_and_latches_then_clears() {
     }
 
     let bytes = std::fs::read(&model_p).unwrap();
-    let model = Model::load(&bytes).expect("model loads");
+    let (config, weights) = Weights::load(&bytes).expect("model loads");
 
     // Parse the stream CSV into a flat sample vector.
     let text = std::fs::read_to_string(&stream_p).unwrap();
@@ -71,10 +72,13 @@ fn replay_matches_reference_and_latches_then_clears() {
     let ref_state = |w: usize| rd_i32(&r, track_off + w * 8);
     let ref_latched = |w: usize| rd_i32(&r, track_off + w * 8 + 4);
 
-    // Drive the real pipeline at the reference threshold.
+    // Drive the real pipeline at the reference threshold. The run state is carved once and
+    // reused for every window, exactly as the firmware loop does.
     let mut windower = Windower::new();
     let mut alert = AlertMachine::with_confidence(thr);
-    let mut scratch = vec![0.0f32; model.config().arena_floats()];
+    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut arena = Arena::new(&mut scratch);
+    let mut state = RunState::new(&mut arena, &config).unwrap();
 
     let mut w = 0usize;
     let mut max_abs = 0.0f32;
@@ -86,7 +90,7 @@ fn replay_matches_reference_and_latches_then_clears() {
         let Some(window) = windower.push(*s) else {
             continue;
         };
-        let out = process_window(&model, window, &mut scratch, &mut alert).unwrap();
+        let out = process_window(&config, &weights, window, &mut state, &mut alert);
 
         // Probs vs PyTorch.
         for c in 0..N_CLASSES {

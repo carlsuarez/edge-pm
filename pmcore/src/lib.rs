@@ -30,3 +30,10 @@ pub mod alert;
 pub mod features;
 pub mod model;
 pub mod pipeline;
+pub mod state;
+pub use state::RunState;
+
+/// Re-export of the engine's bump [`Arena`](engine::Arena): callers carve a [`RunState`] from
+/// one at startup (sized by [`ModelConfig::arena_floats`](model::ModelConfig::arena_floats))
+/// and reuse it for every window, so they need the type without depending on `engine` directly.
+pub use engine::Arena;
