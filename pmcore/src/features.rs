@@ -30,6 +30,9 @@ pub const FEATURE_LEN: usize = N_AXES * FEATURES_PER_AXIS;
 /// One acquisition sample: a reading on each axis, as delivered by the ADXL345.
 pub type Sample = [i16; N_AXES];
 
+/// A zeroed sample, used to initialize window buffers before acquisition fills them.
+pub const DEFAULT_SAMPLE: Sample = [0; N_AXES];
+
 /// Extract the per-window feature vector from a raw sample window.
 ///
 /// Fills `out` with the per-axis RMS, crest factor, and kurtosis of `window`, grouped by

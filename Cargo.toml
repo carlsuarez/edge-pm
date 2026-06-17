@@ -2,8 +2,8 @@
 members = ["pmcore", "host-sim"]
 # `firmware` is a no_std Cortex-M4F binary with its own compile target and linker
 # script, so it is excluded from the default workspace — `cargo build`/`test` at the
-# root stay host-native and fast. It is wired up in Milestone E and built explicitly
-# (`cargo build -p firmware --target thumbv7em-none-eabihf` from inside `firmware/`).
+# root stay host-native and fast. Build it explicitly from inside its own directory:
+# `cd firmware && cargo build` (hardware) or `firmware/renode/run.sh` (sim, in Renode).
 exclude = ["firmware"]
 resolver = "2"
 

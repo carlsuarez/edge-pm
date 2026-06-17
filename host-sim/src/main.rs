@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use pmcore::alert::{AlertMachine, State, ALERT_CONFIDENCE};
 use pmcore::features::{extract, Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
 use pmcore::model::{Class, Weights, N_CLASSES};
-use pmcore::pipeline::{process_window, Windower};
+use pmcore::pipeline::process_window;
 use pmcore::{Arena, RunState};
 
 fn main() -> ExitCode {
@@ -55,7 +55,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Stage 2: print the 9-element feature vector for a window.
+/// Print the 9-element feature vector for a window.
 fn cmd_features(window_path: &str) -> Result<(), String> {
     let window = parse_window(window_path)?;
     let mut feats = [0.0f32; FEATURE_LEN];
@@ -64,7 +64,7 @@ fn cmd_features(window_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Stages 2+3: extract features, run the model, print the class probabilities.
+/// Extract features, run the model, print the class probabilities.
 fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
     let (config, weights) = Weights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
@@ -90,13 +90,12 @@ fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// All stages: chop a sample stream into windows and drive the full pipeline + alert FSM.
+/// Chop a sample stream into windows and drive the full pipeline + alert FSM.
 fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<(), String> {
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
     let (config, weights) = Weights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
     let samples = parse_stream(stream_path)?;
 
-    let mut windower = Windower::new();
     let mut alert = AlertMachine::with_confidence(confidence);
 
     // Carve the run state once up front; every window reuses it (no per-window allocation),
@@ -105,20 +104,24 @@ fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<()
     let mut arena = Arena::new(&mut scratch);
     let mut state = RunState::new(&mut arena, &config).map_err(|e| format!("{e:?}"))?;
 
+    let full_windows = samples.len() / WINDOW_LEN;
     eprintln!(
-        "replay: {} samples, alert-confidence {:.2}",
+        "replay: {} samples ({full_windows} full windows), alert-confidence {:.2}",
         samples.len(),
         confidence
     );
+
     let mut windows = 0usize;
     let mut alerts = 0usize;
     let mut prev = State::Normal;
 
-    for s in &samples {
-        let Some(window) = windower.push(*s) else {
-            continue;
-        };
+    // Chop the stream into WINDOW_LEN windows and drive the full pipeline over each, exactly
+    // as the firmware loops over windows the sampler hands it. A trailing partial window
+    // (fewer than WINDOW_LEN samples) is ignored, as a real acquisition would.
+    for chunk in samples.chunks_exact(WINDOW_LEN) {
+        let window: &[Sample; WINDOW_LEN] = chunk.try_into().expect("chunks_exact yields WINDOW_LEN");
         let out = process_window(&config, &weights, window, &mut state, &mut alert);
+
         println!(
             "win {:>3}  {}  class={:<14} conf={:.4}  state={}",
             windows,
@@ -136,14 +139,17 @@ fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<()
             if matches!(out.state, State::Alert { .. }) {
                 alerts += 1;
             }
+            prev = out.state;
         }
-        prev = out.state;
         windows += 1;
     }
 
-    let leftover = windower.fill_level();
+    let leftover = samples.len() % WINDOW_LEN;
+    if leftover != 0 {
+        eprintln!("  ({leftover} trailing samples ignored: not a full window)");
+    }
     eprintln!(
-        "replay done: {windows} windows, {alerts} alert(s) raised, final state {}, {leftover} trailing samples dropped",
+        "replay done: {windows} windows, {alerts} alert(s) raised, final state {}",
         fmt_state(prev)
     );
     Ok(())

@@ -1,9 +1,9 @@
-# Milestone E placeholder — NOT built yet. This crate is excluded from the workspace
-# (see the root Cargo.toml) so the host build/test stay clean. The embassy + driver
-# dependencies below are the intended setup, left commented until Milestone E so the
-# manifest stays resolvable without pulling the (large, thumbv7em-only) embassy tree.
+# edge-pm firmware: ADXL345 acquisition + on-device 1-D CNN inference (STM32F411RE).
 #
-# Excluded crates cannot inherit `[workspace.package]`, so version/edition are explicit.
+# Excluded from the host workspace (own compile target + linker script — see the root
+# Cargo.toml), so version/edition are explicit (excluded crates can't inherit
+# `[workspace.package]`). Build with: `cd firmware && cargo build` (uses .cargo/config.toml,
+# target thumbv7em-none-eabihf).
 [package]
 name = "firmware"
 description = "edge-pm firmware: ADXL345 acquisition + on-device 1-D CNN inference (STM32F411)"
@@ -14,14 +14,41 @@ license = "MIT"
 [[bin]]
 name = "firmware"
 path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+# Emulation/CI build: replaces the ADXL345 FIFO source with a flash-baked sample stream so
+# the pipeline + alert FSM + UART log can run in Renode with no sensor model. See
+# `src/sim_source.rs` and `renode/`.
+sim = []
 
 [dependencies]
 pmcore = { path = "../pmcore" }
 
-# --- Milestone E (uncomment + pin versions when the firmware shell is built) ---
-# cortex-m        = "0.7"
-# cortex-m-rt     = "0.7"
-# panic-halt      = "0.2"
-# embassy-executor = { version = "*", features = ["arch-cortex-m", "executor-thread"] }
-# embassy-stm32   = { version = "*", features = ["stm32f411re", "time-driver-any", "exti"] }
-# embassy-time    = "*"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
+embassy-stm32 = { version = "0.6", features = [
+    "stm32f411re",
+    "time-driver-any",
+    "exti",
+] }
+embassy-time = "0.4"
+
+static_cell = "2"
+heapless = "0.8"
+embassy-sync = "0.8.0"
+
+[profile.dev]
+opt-level = "s"        # the engine's f32 kernels are unbearable at -O0 even in dev
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true
+panic = "abort"

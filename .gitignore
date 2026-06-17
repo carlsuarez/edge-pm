@@ -4,3 +4,9 @@
 /venv
 __pycache__/
 *.pyc
+
+# Renode robot-test artifacts (renode-test writes these into the run directory)
+log.html
+report.html
+robot_output.xml
+snapshots/

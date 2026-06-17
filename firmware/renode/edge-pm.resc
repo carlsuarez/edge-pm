@@ -1,0 +1,19 @@
+:name: edge-pm sim bring-up
+:description: Boots the `--features sim` firmware on an emulated STM32F411 and runs the baked
+:            bearing_stream through the on-device pipeline, latching then clearing an alert.
+:
+: Build the ELF first:  cd firmware && cargo build --features sim
+: Run:                  renode firmware/renode/edge-pm.resc   (add `start` or run headless)
+
+using sysbus
+mach create "edge-pm"
+machine LoadPlatformDescription @renode/stm32f411.repl
+
+# Mirror USART2 to the Renode console so the alert log is visible headless.
+showAnalyzer sysbus.usart2 Antmicro.Renode.Analyzers.LoggingUartAnalyzer
+
+macro reset
+"""
+    sysbus LoadELF @target/thumbv7em-none-eabihf/debug/firmware
+"""
+runMacro $reset
