@@ -12,7 +12,7 @@
 
 use crate::alert::{top_class, AlertMachine, State};
 use crate::features::{self, Sample, FEATURE_LEN, WINDOW_LEN};
-use crate::model::{forward, Class, ModelConfig, Weights, N_CLASSES};
+use crate::model::{forward, forward_q8, Class, ModelConfig, QuantizedWeights, Weights, N_CLASSES};
 use crate::RunState;
 
 /// The result of running one window through the full pipeline.
@@ -36,8 +36,8 @@ pub struct Outcome {
 /// This is the **steady-state loop body** — on-device it is called once per window for the
 /// life of the program. It allocates nothing and reuses the caller-owned working set: the
 /// [`Weights`] and the [`RunState`] (whose arena is carved exactly once at startup by
-/// [`RunState::new`], *not* here) are borrowed, never built. `state.logits` is overwritten
-/// each call. Identical on host and device.
+/// [`RunState::new`], *not* here) are borrowed, never built. The probabilities are written to
+/// a caller-owned buffer each call. Identical on host and device.
 pub fn process_window(
     config: &ModelConfig,
     weights: &Weights,
@@ -48,16 +48,46 @@ pub fn process_window(
     let mut feats = [0.0f32; FEATURE_LEN];
     features::extract(window, &mut feats);
 
-    forward(config, weights, state, window, &feats);
+    let mut probs = [0.0f32; N_CLASSES];
+    forward(config, weights, state, window, &feats, &mut probs);
+    decide(feats, probs, alert)
+}
+
+/// The **integer-only** int8 twin of [`process_window`]: identical pipeline driven by
+/// [`forward_q8`] over [`QuantizedWeights`].
+///
+/// Differs only in that the model runs in integer arithmetic, so it takes a
+/// [`RunState<i8>`](RunState) (the int8 working set, carved once at startup) instead of the fp32
+/// [`RunState`] activation arena. Feature extraction and the alert decision are shared with
+/// the fp32 path.
+pub fn process_window_q8(
+    config: &ModelConfig,
+    weights: &QuantizedWeights,
+    window: &[Sample; WINDOW_LEN],
+    state: &mut RunState<i8>,
+    alert: &mut AlertMachine,
+) -> Outcome {
+    let mut feats = [0.0f32; FEATURE_LEN];
+    features::extract(window, &mut feats);
 
     let mut probs = [0.0f32; N_CLASSES];
-    probs.copy_from_slice(state.logits);
+    forward_q8(config, weights, state, window, &feats, &mut probs);
 
+    decide(feats, probs, alert)
+}
+
+/// Shared tail of both `process_window` variants: take the probabilities the forward pass
+/// produced, advance the alert machine, and bundle the [`Outcome`].
+fn decide(
+    features: [f32; FEATURE_LEN],
+    probs: [f32; N_CLASSES],
+    alert: &mut AlertMachine,
+) -> Outcome {
     let alert_state = alert.update(&probs);
     let (class, confidence) = top_class(&probs);
 
     Outcome {
-        features: feats,
+        features,
         probs,
         class,
         confidence,

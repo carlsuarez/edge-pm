@@ -84,7 +84,7 @@ fn replay_matches_pytorch_probs_and_fsm_trajectory() {
         "stream length must be exactly {n_windows} windows"
     );
 
-    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut scratch = vec![0.0f32; config.buf_len()];
     let mut arena = Arena::new(&mut scratch);
     let mut state = RunState::new(&mut arena, &config).unwrap();
     // Match the FSM the reference was generated with.

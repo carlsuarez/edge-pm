@@ -23,6 +23,11 @@ bench = false
 # `src/sim_source.rs` and `renode/`.
 sim = []
 
+# Int8 (integer-only) build: bakes the quantized v2 checkpoint and runs `process_window_q8`
+# (the Milestone-F stretch). Orthogonal to `sim` — combine `--features sim,q8` for the Renode
+# int8 demo, or `--features q8` for the hardware int8 build. See `pmcore::model::forward_q8`.
+q8 = []
+
 [dependencies]
 pmcore = { path = "../pmcore" }
 

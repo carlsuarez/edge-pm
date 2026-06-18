@@ -82,7 +82,7 @@ fn forward_pass_matches_pytorch_reference() {
         );
     }
 
-    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut scratch = vec![0.0f32; config.buf_len()];
     let mut arena = Arena::new(&mut scratch);
     let mut state = RunState::new(&mut arena, &config).unwrap();
     let mut alert = AlertMachine::new();

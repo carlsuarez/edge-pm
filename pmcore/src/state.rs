@@ -4,16 +4,21 @@
 //! activation buffers the forward pass reads and writes, each a disjoint sub-slice of a
 //! single caller-provided [`Arena`]. It holds no weights and no [`ModelConfig`] — the free
 //! [`forward`](crate::model::forward) function is handed the state, the weights, and the
-//! config as three separate arguments. The buffer sizes come straight from the config and
-//! sum to exactly [`ModelConfig::arena_floats`], so a forward pass allocates nothing.
+//! config as separate arguments.
+//!
+//! It is generic over the activation element type `T` (defaulting to `f32`): the float
+//! forward pass runs on `RunState<f32>` carved from an `Arena<f32>`, and the integer-only
+//! pass on `RunState<i8>` carved from an `Arena<i8>` — same layout, same code, only the type
+//! differs. The buffer sizes come straight from the config and sum to exactly
+//! [`ModelConfig::buf_len`], so a forward pass allocates nothing.
 //!
 //! [`Arena`]: engine::Arena
-//! [`ModelConfig::arena_floats`]: crate::model::ModelConfig::arena_floats
+//! [`ModelConfig::buf_len`]: crate::model::ModelConfig::buf_len
 
 use engine::{Arena, EngineError};
 
 use crate::features::{Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
-use crate::model::{ModelConfig, N_CLASSES};
+use crate::model::ModelConfig;
 
 /// Why a [`RunState`] accessor rejected its arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,51 +27,54 @@ pub enum RunStateError {
     BadChannel,
 }
 
-/// All mutable activation buffers a single forward pass reads and writes.
+/// All mutable activation buffers a single forward pass reads and writes, over the element
+/// type `T` (defaults to `f32`).
 ///
 /// Every field borrows a disjoint sub-slice of one arena block (`'buf`); because
 /// [`Arena::alloc`] ties each slice to the block's lifetime rather than to the arena
 /// borrow, they can all be held at once. Reused in place for every window, so the
-/// steady-state pipeline allocates nothing.
-pub struct RunState<'buf> {
-    /// De-interleaved input, `[N_AXES, WINDOW_LEN]` (channel-major, `f32`).
-    pub x: &'buf mut [f32],
+/// steady-state pipeline allocates nothing. The float (`RunState<f32>`) and integer-only
+/// (`RunState<i8>`) paths share this one type; only the dense **logits** differ in width
+/// (`f32` vs `i32`) and so are kept as a forward-pass local rather than a field here.
+pub struct RunState<'buf, T = f32> {
+    /// Input, `[N_AXES, WINDOW_LEN]` (channel-major): de-interleaved `f32` on the float
+    /// path, de-interleaved + quantized int8 on the integer path.
+    pub x: &'buf mut [T],
     /// conv1 → relu output, `[c1, l1]`.
-    pub x_c1: &'buf mut [f32],
+    pub x_c1: &'buf mut [T],
     /// conv2 → relu output, `[c2, l2]`.
-    pub x_c2: &'buf mut [f32],
-    /// Global-average-pool result with the fused features appended, `[c2 + FEATURE_LEN]`.
-    pub glb_avg_pool: &'buf mut [f32],
-    /// Dense-head output, `[N_CLASSES]` — class probabilities after
-    /// [`forward`](crate::model::forward) (the closing softmax writes them here).
-    pub logits: &'buf mut [f32],
+    pub x_c2: &'buf mut [T],
+    /// Global-average-pool result with the fused features appended, `[c2 + FEATURE_LEN]` —
+    /// the dense head's input.
+    pub fc_in: &'buf mut [T],
 }
 
-impl<'buf> RunState<'buf> {
-    /// Carve every activation buffer out of `arena` for `config`.
-    ///
-    /// Allocates in a fixed order whose total is exactly [`ModelConfig::arena_floats`].
+impl<'buf, T: Copy + Default> RunState<'buf, T> {
+    /// Carve every activation buffer out of `arena` for `config`, in a fixed order whose
+    /// total is exactly [`ModelConfig::buf_len`].
     ///
     /// # Errors
     /// [`EngineError::ArenaOverflow`] if the arena is smaller than the budget (size it with
-    /// [`ModelConfig::arena_floats`] to guarantee a fit).
+    /// [`ModelConfig::buf_len`] to guarantee a fit).
     ///
-    /// [`ModelConfig::arena_floats`]: crate::model::ModelConfig::arena_floats
+    /// [`ModelConfig::buf_len`]: crate::model::ModelConfig::buf_len
     pub fn new(
-        arena: &mut Arena<'buf>,
+        arena: &mut Arena<'buf, T>,
         config: &ModelConfig,
-    ) -> Result<RunState<'buf>, EngineError> {
+    ) -> Result<RunState<'buf, T>, EngineError> {
         Ok(RunState {
             x: arena.alloc(N_AXES * WINDOW_LEN)?,
             x_c1: arena.alloc(config.c1 * config.l1())?,
             x_c2: arena.alloc(config.c2 * config.l2())?,
-            glb_avg_pool: arena.alloc(config.c2 + FEATURE_LEN)?,
-            logits: arena.alloc(N_CLASSES)?,
+            fc_in: arena.alloc(config.c2 + FEATURE_LEN)?,
         })
     }
+}
 
+impl<'buf> RunState<'buf, f32> {
     /// De-interleave a window of 3-axis samples into the channel-major [`x`](Self::x) buffer
-    /// (axis `ch` occupies `x[ch*WINDOW_LEN..][..WINDOW_LEN]`), ready for `conv1d`.
+    /// (axis `ch` occupies `x[ch*WINDOW_LEN..][..WINDOW_LEN]`), ready for `conv1d`. Float
+    /// path only — the integer path de-interleaves *and* quantizes in `forward_q8`.
     pub fn x_from_window(&mut self, window: &[Sample; WINDOW_LEN]) {
         for ch in 0..N_AXES {
             let row = &mut self.x[ch * WINDOW_LEN..][..WINDOW_LEN];
@@ -110,7 +118,7 @@ mod tests {
     #[test]
     fn carves_all_buffers_and_consumes_exactly_the_budget() {
         let c = cfg();
-        let total = c.arena_floats();
+        let total = c.buf_len();
         let mut buf = vec![0.0f32; total];
         let mut arena = Arena::new(&mut buf);
         let s = RunState::new(&mut arena, &c).unwrap();
@@ -118,16 +126,27 @@ mod tests {
         assert_eq!(s.x.len(), N_AXES * WINDOW_LEN);
         assert_eq!(s.x_c1.len(), c.c1 * c.l1());
         assert_eq!(s.x_c2.len(), c.c2 * c.l2());
-        assert_eq!(s.glb_avg_pool.len(), c.c2 + FEATURE_LEN);
-        assert_eq!(s.logits.len(), N_CLASSES);
+        assert_eq!(s.fc_in.len(), c.c2 + FEATURE_LEN);
         // The budget is exact: the activations fill the arena with nothing left over.
+        assert_eq!(arena.remaining(), 0);
+    }
+
+    #[test]
+    fn carves_an_int8_state_from_the_same_budget() {
+        // The same generic carves an i8 working set from an i8 arena of the same length.
+        let c = cfg();
+        let mut buf = vec![0i8; c.buf_len()];
+        let mut arena = Arena::new(&mut buf);
+        let s: RunState<i8> = RunState::new(&mut arena, &c).unwrap();
+        assert_eq!(s.x.len(), N_AXES * WINDOW_LEN);
+        assert_eq!(s.fc_in.len(), c.c2 + FEATURE_LEN);
         assert_eq!(arena.remaining(), 0);
     }
 
     #[test]
     fn too_small_arena_overflows() {
         let c = cfg();
-        let mut buf = vec![0.0f32; c.arena_floats() - 1];
+        let mut buf = vec![0.0f32; c.buf_len() - 1];
         let mut arena = Arena::new(&mut buf);
         assert!(matches!(
             RunState::new(&mut arena, &c),
@@ -138,7 +157,7 @@ mod tests {
     #[test]
     fn x_from_window_de_interleaves_by_axis() {
         let c = cfg();
-        let mut buf = vec![0.0f32; c.arena_floats()];
+        let mut buf = vec![0.0f32; c.buf_len()];
         let mut arena = Arena::new(&mut buf);
         let mut s = RunState::new(&mut arena, &c).unwrap();
 

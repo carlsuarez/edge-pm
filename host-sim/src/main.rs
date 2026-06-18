@@ -22,8 +22,8 @@ use std::process::ExitCode;
 
 use pmcore::alert::{AlertMachine, State, ALERT_CONFIDENCE};
 use pmcore::features::{extract, Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
-use pmcore::model::{Class, Weights, N_CLASSES};
-use pmcore::pipeline::process_window;
+use pmcore::model::{Class, ModelConfig, ModelWeights, N_CLASSES};
+use pmcore::pipeline::{process_window, process_window_q8, Outcome};
 use pmcore::{Arena, RunState};
 
 fn main() -> ExitCode {
@@ -64,22 +64,48 @@ fn cmd_features(window_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Run one window through the pipeline, dispatching on the loaded representation: `state` is
+/// the fp32 activation arena, `istate` the int8 working set; each is used only by its path.
+fn run_window(
+    config: &ModelConfig,
+    weights: &ModelWeights,
+    window: &[Sample; WINDOW_LEN],
+    state: &mut RunState,
+    istate: &mut RunState<i8>,
+    alert: &mut AlertMachine,
+) -> Outcome {
+    match weights {
+        ModelWeights::F32(w) => process_window(config, w, window, state, alert),
+        ModelWeights::Q8(qw) => process_window_q8(config, qw, window, istate, alert),
+    }
+}
+
 /// Extract features, run the model, print the class probabilities.
 fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
-    let (config, weights) = Weights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
+    let (config, weights) = ModelWeights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
 
     let window = parse_window(window_path)?;
 
     // Carve the run state once, exactly as the firmware does at startup.
-    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut scratch = vec![0.0f32; config.buf_len()];
     let mut arena = Arena::new(&mut scratch);
     let mut state = RunState::new(&mut arena, &config).map_err(|e| format!("{e:?}"))?;
+    let mut iscratch = vec![0i8; config.buf_len()];
+    let mut iarena = Arena::new(&mut iscratch);
+    let mut istate = RunState::new(&mut iarena, &config).map_err(|e| format!("{e:?}"))?;
 
     // Reuse the shared per-window step; the alert machine is a throwaway here (this command
     // reports a single window's probabilities, not a running alert state).
     let mut alert = AlertMachine::new();
-    let out = process_window(&config, &weights, &window, &mut state, &mut alert);
+    let out = run_window(
+        &config,
+        &weights,
+        &window,
+        &mut state,
+        &mut istate,
+        &mut alert,
+    );
 
     println!("{}", join(&out.probs));
     eprintln!(
@@ -93,16 +119,19 @@ fn cmd_infer(model_path: &str, window_path: &str) -> Result<(), String> {
 /// Chop a sample stream into windows and drive the full pipeline + alert FSM.
 fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<(), String> {
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
-    let (config, weights) = Weights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
+    let (config, weights) = ModelWeights::load(&bytes).map_err(|e| format!("{model_path}: {e}"))?;
     let samples = parse_stream(stream_path)?;
 
     let mut alert = AlertMachine::with_confidence(confidence);
 
     // Carve the run state once up front; every window reuses it (no per-window allocation),
     // mirroring how the firmware sets up its static arena at boot and loops forever.
-    let mut scratch = vec![0.0f32; config.arena_floats()];
+    let mut scratch = vec![0.0f32; config.buf_len()];
     let mut arena = Arena::new(&mut scratch);
     let mut state = RunState::new(&mut arena, &config).map_err(|e| format!("{e:?}"))?;
+    let mut iscratch = vec![0i8; config.buf_len()];
+    let mut iarena = Arena::new(&mut iscratch);
+    let mut istate = RunState::new(&mut iarena, &config).map_err(|e| format!("{e:?}"))?;
 
     let full_windows = samples.len() / WINDOW_LEN;
     eprintln!(
@@ -119,8 +148,16 @@ fn cmd_replay(model_path: &str, stream_path: &str, confidence: f32) -> Result<()
     // as the firmware loops over windows the sampler hands it. A trailing partial window
     // (fewer than WINDOW_LEN samples) is ignored, as a real acquisition would.
     for chunk in samples.chunks_exact(WINDOW_LEN) {
-        let window: &[Sample; WINDOW_LEN] = chunk.try_into().expect("chunks_exact yields WINDOW_LEN");
-        let out = process_window(&config, &weights, window, &mut state, &mut alert);
+        let window: &[Sample; WINDOW_LEN] =
+            chunk.try_into().expect("chunks_exact yields WINDOW_LEN");
+        let out = run_window(
+            &config,
+            &weights,
+            window,
+            &mut state,
+            &mut istate,
+            &mut alert,
+        );
 
         println!(
             "win {:>3}  {}  class={:<14} conf={:.4}  state={}",

@@ -60,8 +60,20 @@ use embassy_time::{Duration, Timer};
 use crate::sampler::{sampler_task, SpiPins};
 use pmcore::alert::{AlertMachine, State};
 use pmcore::features::{Sample, DEFAULT_SAMPLE, WINDOW_LEN};
-use pmcore::model::{ModelConfig, Weights};
-use pmcore::pipeline::{process_window, Outcome};
+use pmcore::model::ModelConfig;
+use pmcore::pipeline::Outcome;
+
+// The model representation is fixed at build time by the `q8` feature, so the load path,
+// working set, and per-window step are cfg-selected (no runtime dispatch) — this is what lets
+// the int8 build carve only its ~4×-smaller integer buffer and skip the fp32 activation arena.
+#[cfg(feature = "q8")]
+use pmcore::model::QuantizedWeights;
+#[cfg(not(feature = "q8"))]
+use pmcore::model::Weights;
+#[cfg(not(feature = "q8"))]
+use pmcore::pipeline::process_window;
+#[cfg(feature = "q8")]
+use pmcore::pipeline::process_window_q8;
 use pmcore::{Arena, RunState};
 
 bind_interrupts!(struct Irqs {
@@ -80,17 +92,33 @@ bind_interrupts!(struct Irqs {
 struct Aligned<const N: usize>([u8; N]);
 
 // The hardware build classifies live ADXL data; the sim build replays a stream that was
-// generated against its own checked-in model, so each picks the matching checkpoint.
-#[cfg(not(feature = "sim"))]
+// generated against its own checked-in model, so each picks the matching checkpoint — and
+// the `q8` feature selects the int8 (v2) version of whichever model the build uses.
+#[cfg(all(not(feature = "sim"), not(feature = "q8")))]
 macro_rules! model_file {
     () => {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../models/bearing_cnn.bin")
     };
 }
-#[cfg(feature = "sim")]
+#[cfg(all(not(feature = "sim"), feature = "q8"))]
+macro_rules! model_file {
+    () => {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../models/bearing_cnn_q8.bin")
+    };
+}
+#[cfg(all(feature = "sim", not(feature = "q8")))]
 macro_rules! model_file {
     () => {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../models/bearing_stream.bin")
+    };
+}
+#[cfg(all(feature = "sim", feature = "q8"))]
+macro_rules! model_file {
+    () => {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../models/bearing_stream_q8.bin"
+        )
     };
 }
 
@@ -106,7 +134,17 @@ const CFG: ModelConfig = ModelConfig {
     s2: 2,
 };
 
-static SCRATCH: StaticCell<[f32; CFG.arena_floats()]> = StaticCell::new();
+/// fp32 forward-pass arena (fp32 build only): every activation buffer is carved from this
+/// once at boot, so the steady-state loop allocates nothing.
+#[cfg(not(feature = "q8"))]
+static SCRATCH: StaticCell<[f32; CFG.buf_len()]> = StaticCell::new();
+
+/// Int8 working buffer for the integer-only forward pass (q8 build only) — holds the
+/// de-interleaved window, both conv int8 outputs, and the int8 dense input
+/// ([`ModelConfig::buf_len`] elements, but `i8` not `f32`), ~4× smaller than the fp32 arena in
+/// bytes. Carved once at boot.
+#[cfg(feature = "q8")]
+static QSCRATCH: StaticCell<[i8; CFG.buf_len()]> = StaticCell::new();
 
 // --- sim: one reusable window buffer (single producer/consumer, in the main task) --------
 #[cfg(feature = "sim")]
@@ -174,12 +212,24 @@ async fn main(spawner: Spawner) {
     .unwrap();
     let _ = uart.blocking_write(b"edge-pm: boot\r\n");
 
-    // Carve the run state once, mirroring how the firmware sets up its static arena at boot.
-    let scratch = SCRATCH.init([0.0; CFG.arena_floats()]);
-    let mut arena = Arena::new(scratch);
+    // Load the baked model and carve its working set once, mirroring the host startup. The
+    // representation is cfg-fixed: the fp32 build carves the fp32 arena + RunState; the int8
+    // build carves only the (much smaller) integer working buffer.
+    #[cfg(not(feature = "q8"))]
     let (cfg, weights) = Weights::load(&MODEL.0).unwrap();
+    #[cfg(feature = "q8")]
+    let (cfg, weights) = QuantizedWeights::load(&MODEL.0).unwrap();
     assert_eq!(cfg, CFG);
-    let mut state = RunState::new(&mut arena, &cfg).unwrap();
+
+    let mut state = {
+        #[cfg(not(feature = "q8"))]
+        let scratch = SCRATCH.init([0.0; CFG.buf_len()]);
+        #[cfg(feature = "q8")]
+        let scratch = QSCRATCH.init([0; CFG.buf_len()]);
+
+        let mut arena = Arena::new(scratch);
+        RunState::new(&mut arena, &cfg).unwrap()
+    };
     let mut alert = AlertMachine::new();
     let mut prev = State::Normal;
 
@@ -200,7 +250,10 @@ async fn main(spawner: Spawner) {
             window[fill] = sample;
             fill += 1;
             if fill == WINDOW_LEN {
+                #[cfg(not(feature = "q8"))]
                 let out = process_window(&cfg, &weights, window, &mut state, &mut alert);
+                #[cfg(feature = "q8")]
+                let out = process_window_q8(&cfg, &weights, window, &mut state, &mut alert);
                 handle_outcome(&out, &mut prev, &mut led, &mut uart);
                 fill = 0;
             }
@@ -238,7 +291,10 @@ async fn main(spawner: Spawner) {
 
         loop {
             let window = FULL_Q.receive().await;
+            #[cfg(not(feature = "q8"))]
             let out = process_window(&cfg, &weights, window, &mut state, &mut alert);
+            #[cfg(feature = "q8")]
+            let out = process_window_q8(&cfg, &weights, window, &mut state, &mut alert);
             handle_outcome(&out, &mut prev, &mut led, &mut uart);
             FREE_Q.send(window).await; // return the buffer to circulation
         }

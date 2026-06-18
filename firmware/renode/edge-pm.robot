@@ -32,7 +32,9 @@ Sim Stream Latches Then Clears An Alert
     Wait For Line On Uart     edge-pm: sim source (baked bearing_stream)
 
     # The impulsive windows drive z-axis kurtosis past threshold -> outer_race alert latches.
-    Wait For Line On Uart     ALERT outer_race conf=0.96    treatAsRegex=true
+    # conf=1.000 is the fp32 softmax PyTorch produced on the impulsive windows (see
+    # tools/make_stream.py), reproduced on the Cortex-M4F.
+    Wait For Line On Uart     ALERT outer_race conf=1.000    treatAsRegex=true
 
     # Three consecutive normal windows clear it (the AlertMachine hysteresis).
     Wait For Line On Uart     CLEAR

@@ -31,7 +31,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export_model import (
-    BearingCNN, write_model, DEFAULT_CFG,
+    BearingCNN, write_model, write_quantized_model, DEFAULT_CFG,
     N_AXES, WINDOW_LEN, FEATURE_LEN, N_CLASSES,
 )
 from verify_features import features as compute_features
@@ -46,7 +46,7 @@ IMPULSE_PLAN = [False, False, True, True, False, False, False, False]
 
 OUTER_RACE = 2          # class index the z-kurtosis feature is wired to drive
 Z_KURT_FEATURE = 8      # feature index of axis-2 kurtosis in the 9-vector
-KURT_WEIGHT = 0.3       # dense weight on z-kurtosis -> outer_race logit
+KURT_WEIGHT = 0.6       # dense weight on z-kurtosis -> outer_race logit
 NORMAL_BIAS = 2.5       # dense bias on normal: quiet kurtosis (~3) keeps normal on top
 
 
@@ -133,6 +133,8 @@ def main():
     )
     ap.add_argument("--out", required=True, help="output stem (writes <out>.bin/.csv/.ref.bin)")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--quantize", action="store_true",
+                    help="also emit an int8 (W8A8) v2 demo model, <out>_q8.bin")
     args = ap.parse_args()
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
@@ -149,6 +151,13 @@ def main():
     write_model(bin_path, model, cfg)
     np.savetxt(csv_path, stream, fmt="%d", delimiter=",")
     write_ref(ref_path, probs, ALERT_CONFIDENCE, track)
+    if args.quantize:
+        q8_path = args.out + "_q8.bin"
+        # Calibrate the activation scales over every window in the stream.
+        cal_windows = [stream[w * WINDOW_LEN:(w + 1) * WINDOW_LEN] for w in range(n_windows)]
+        cal_feats = [compute_features(win) for win in cal_windows]
+        write_quantized_model(q8_path, model, cfg, cal_windows, cal_feats)
+        print(f"wrote {q8_path}  (int8 integer-only, v2)")
 
     names = ["normal", "inner_race", "outer_race", "rolling_element"]
     print(f"wrote {bin_path}")
