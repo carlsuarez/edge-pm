@@ -438,8 +438,8 @@ pub fn forward(
 /// Zero-copy views of an **integer-only** (static) int8 model — the quantized twin of
 /// [`Weights`].
 ///
-/// This is true integer-only inference (CMSIS-NN / TFLite style), **not** dynamic
-/// quantization: weights *and* activations are int8, accumulation is `i32`, and the
+/// This is true integer-only inference (the standard static-quantization scheme), **not**
+/// dynamic quantization: weights *and* activations are int8, accumulation is `i32`, and the
 /// per-output-channel `i32` accumulator is rescaled to the next layer's int8 domain by a
 /// **fixed-point** multiplier (`mult`, `shift`) — no float in the hot path. The activation
 /// scales (`s_in0`, `s_fc_in`) and the per-class output scale are baked at export from a
@@ -957,10 +957,7 @@ mod tests {
         forward(&config, &weights, &mut state, &window, &feats, &mut probs_f);
 
         // Activation scales (per-tensor) calibrated from the captured fp32 activations.
-        let win_abs = window
-            .iter()
-            .flatten()
-            .fold(0i16, |m, &v| m.max(v.abs())) as f32;
+        let win_abs = window.iter().flatten().fold(0i16, |m, &v| m.max(v.abs())) as f32;
         let s_in0 = win_abs / 127.0;
         let s_c1 = max_abs(state.x_c1) / 127.0;
         let s_c2 = max_abs(state.x_c2) / 127.0;
@@ -1051,7 +1048,7 @@ mod tests {
         x.iter().fold(0.0f32, |m, &v| m.max(libm::fabsf(v)))
     }
 
-    // Reference QuantizeMultiplier (offline): real M>0 → (Q31 mantissa, signed shift).
+    // Reference multiplier quantization (offline): real M>0 → (Q31 mantissa, signed shift).
     fn quantize_multiplier(m: f32) -> (i32, i32) {
         if m == 0.0 {
             return (0, 0);

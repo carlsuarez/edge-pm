@@ -97,7 +97,7 @@ def quantize_rows(w2d):
 
 def quantize_multiplier(m):
     """Split a real multiplier m>0 into a Q31 mantissa in [2^30, 2^31) and a signed shift,
-    matching gemmlowp/TFLite `QuantizeMultiplier` and engine's `requantize`. m == 0 -> (0, 0)."""
+    matching engine's `requantize`. m == 0 -> (0, 0)."""
     if m == 0.0:
         return 0, 0
     frac, shift = math.frexp(m)            # m = frac * 2^shift, frac in [0.5, 1)
@@ -135,7 +135,7 @@ def calibrate(model, windows, feats_list):
 
 def write_quantized_model(path, model, cfg, cal_windows, cal_feats):
     """Serialize the model in the v2 **integer-only** (static int8) format that
-    `pmcore::model::QuantizedWeights` loads — the CMSIS-NN / TFLite scheme.
+    `pmcore::model::QuantizedWeights` loads — the standard static-quantization scheme.
 
     Weights are int8 (per-output-channel scale); activations are int8 at calibration-fixed
     per-tensor scales; biases are i32 (pre-scaled to each layer's accumulator domain); and the
