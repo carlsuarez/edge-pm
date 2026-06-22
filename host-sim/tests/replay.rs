@@ -40,7 +40,6 @@ fn class_index(c: Class) -> i32 {
         Class::Normal => 0,
         Class::InnerRace => 1,
         Class::OuterRace => 2,
-        Class::RollingElement => 3,
     }
 }
 

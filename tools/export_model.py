@@ -33,8 +33,8 @@ from verify_features import features as compute_features, gen as gen_window, loa
 # Fixed pipeline dimensions (must match pmcore::features / pmcore::model).
 N_AXES = 3
 WINDOW_LEN = 512
-FEATURE_LEN = 9
-N_CLASSES = 4
+FEATURE_LEN = 24
+N_CLASSES = 3
 MAGIC = b"epm1"
 HEADER_BYTES = 64
 
@@ -243,11 +243,14 @@ def main():
 
     with torch.no_grad():
         # Normalize the dense layer so a randomly-initialized model gives a non-degenerate
-        # (non-saturated) softmax on the test window -- makes the gate meaningful.
-        s = model(x, f).std().item()
-        if s > 1e-6:
-            model.fc.weight.div_(s)
-            model.fc.bias.div_(s)
+        # (non-saturated) softmax on the test window -- makes the gate meaningful. Skip this
+        # for a trained --checkpoint: its logit scale is learned and rescaling it would
+        # distort the calibrated softmax.
+        if not args.checkpoint:
+            s = model(x, f).std().item()
+            if s > 1e-6:
+                model.fc.weight.div_(s)
+                model.fc.bias.div_(s)
         probs = torch.softmax(model(x, f), dim=-1)[0].numpy()
 
     write_model(args.out, model, cfg)

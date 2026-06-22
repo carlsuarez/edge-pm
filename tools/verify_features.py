@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Reference feature computation, the ground truth for `pmcore::features`.
 
-Computes the per-axis RMS, crest factor, and (Pearson) kurtosis for a window of
-accelerometer samples with numpy in float64. The definitions mirror the Rust in
-pmcore/src/features.rs exactly -- same formulas, same per-axis [rms, crest, kurtosis]
-layout -- so `host-sim` (which runs the real Rust `extract`) and this script agree to
-f32 tolerance on identical input. That agreement is the Milestone B gate.
+Computes, with numpy in float64, the per-axis time-domain stats (RMS, crest factor,
+Pearson kurtosis) plus the per-axis log-spaced FFT magnitude bands for a window of
+accelerometer samples. The definitions mirror the Rust in pmcore/src/features.rs exactly
+-- same formulas, same Hann window and band edges, same layout (all-axes stats block, then
+all-axes spectral-band block) -- so `host-sim` (which runs the real Rust `extract`) and
+this script agree to f32 tolerance on identical input. That agreement is the Milestone B
+gate.
 
 Usage:
-    python verify_features.py <window.csv>          # print the 9 features
+    python verify_features.py <window.csv>          # print the 24 features
     python verify_features.py --gen <window.csv>    # write a deterministic test window
 """
 
@@ -17,6 +19,12 @@ import numpy as np
 
 N_AXES = 3
 WINDOW_LEN = 512
+
+# Spectral band features (must match pmcore::features). Log-spaced bin-index edges over the
+# 256-bin magnitude spectrum of a 512-point real FFT; band b is bins BAND_EDGES[b:b+1], DC
+# (bin 0) skipped.
+FFT_BANDS_PER_AXIS = 5
+BAND_EDGES = [1, 3, 9, 28, 84, 256]
 
 
 def axis_features(x):
@@ -34,12 +42,30 @@ def axis_features(x):
     return [rms, crest, kurt]
 
 
+def fft_bands(x):
+    """[FFT_BANDS_PER_AXIS] log1p band magnitudes for one axis, matching pmcore::fft_bands.
+
+    Periodic Hann window (denominator N), real FFT magnitude, summed per log-spaced band,
+    log1p-compressed. The positive-frequency bins 1..255 of numpy's rfft line up with the
+    Rust FFT primitive's bins; DC and Nyquist are excluded by the edge table.
+    """
+    x = x.astype(np.float64)
+    n = len(x)
+    win = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)
+    mag = np.abs(np.fft.rfft(x * win))
+    return [float(np.log1p(np.sum(mag[BAND_EDGES[b]:BAND_EDGES[b + 1]])))
+            for b in range(FFT_BANDS_PER_AXIS)]
+
+
 def features(window):
-    """Flat 9-vector: axis 0's [rms, crest, kurt], then axis 1, then axis 2."""
-    out = []
+    """Flat 24-vector: the per-axis [rms, crest, kurt] stats block, then the per-axis
+    FFT-band block (axis 0's bands, then axis 1, then axis 2)."""
+    stats, bands = [], []
     for a in range(N_AXES):
-        out.extend(axis_features(window[:, a]))
-    return out
+        col = window[:, a]
+        stats.extend(axis_features(col))
+        bands.extend(fft_bands(col))
+    return stats + bands
 
 
 def load_csv(path):

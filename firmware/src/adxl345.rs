@@ -1,12 +1,12 @@
 //! ADXL345 driver — SPI 4-wire, FIFO stream mode with a watermark interrupt.
 //!
-//! The accelerometer runs at its 1600 Hz output data rate and buffers samples in its
+//! The accelerometer runs at its 3200 Hz max output data rate and buffers samples in its
 //! 32-deep hardware FIFO. Once the FIFO reaches [`WATERMARK`] entries it asserts INT1
 //! (active-high), which is wired to an STM32 EXTI line; the [`sampler`](crate::sampler)
 //! task sleeps on that interrupt and only wakes to drain the buffered burst — reading
 //! [`fifo_count`](Adxl345::fifo_count) samples with [`read_fifo_sample`](Adxl345::read_fifo_sample).
 //! This replaces per-sample polling: the CPU is idle between watermark interrupts instead
-//! of spinning at the 1600 Hz sample rate.
+//! of spinning at the 3200 Hz sample rate.
 
 use embassy_stm32::gpio::Output;
 use embassy_stm32::mode::Async;
@@ -50,12 +50,12 @@ impl<'d> Adxl345<'d> {
         Self { spi, cs }
     }
 
-    /// Configure 1600 Hz, ±16 g full-resolution acquisition into the FIFO in stream mode,
+    /// Configure 3200 Hz, ±16 g full-resolution acquisition into the FIFO in stream mode,
     /// with the watermark interrupt routed (active-high) to INT1. Measurement is enabled
     /// last, so no samples are produced until the FIFO + interrupt path is fully set up.
     pub async fn init_fifo(&mut self) {
         self.write(REG_DATA_FORMAT, 0x0B).await; // full-res, ±16 g, INT active-high
-        self.write(REG_BW_RATE, 0x0F).await; // 1600 Hz ODR
+        self.write(REG_BW_RATE, 0x0F).await; // 3200 Hz ODR (rate code 0x0F; max)
         self.write(REG_INT_MAP, 0x00).await; // all interrupts -> INT1 (watermark bit clear)
         self.write(REG_FIFO_CTL, 0x80 | (WATERMARK & 0x1F)).await; // stream mode + watermark
         self.write(REG_INT_ENABLE, INT_WATERMARK).await; // enable the watermark interrupt

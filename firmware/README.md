@@ -16,20 +16,24 @@ Measured release footprint (`size`):
 
 | region | fp32 | int8 (`--features q8`) | of | |
 |--------|------|------------------------|----|--|
-| flash (code + rodata + embedded model) | 80.0 KB | 74.9 KB | 512 KB | 15–16% |
-| RAM (`bss`) | 44.5 KB | 16.4 KB | 128 KB | 13–35% |
-| └ forward-pass arena | 38.5 KB | 9.4 KB | | |
-| embedded model weights | 12,512 B | 3,748 B | | 3.3× |
+| flash (code + rodata + embedded model) | 92.4 KB | 87.0 KB | 512 KB | 17–18% |
+| RAM (`bss`) | 44.6 KB | 16.4 KB | 128 KB | 13–35% |
+| └ forward-pass arena | 37.7 KB | 9.4 KB | | |
+| embedded model weights | 12,524 B | 3,744 B | | 3.3× |
 
 The forward-pass arena and run state are carved **once** at boot from a `static` buffer, so
 the acquisition loop allocates nothing — the same contract `pmcore` enforces. The
 representation is fixed at build time (`q8` cargo feature), so the int8 build carves only the
-smaller `i8` arena: that is where the RAM win comes from.
+smaller `i8` arena: that is where the RAM win comes from. (The flash figures are ~13 KB above
+the earlier time-domain-only build: `pmcore::features` now also runs a Hann-windowed real FFT
+per axis — from `tiny-infer`'s `engine::dsp` — for the log-spaced spectral band features, and
+the dense layer widened with them. The FFT scratch is on the stack, so `bss` is unchanged.)
 
 ## Acquisition (hardware build)
 
-The ADXL345 runs in **FIFO stream mode** (32-deep) and raises **INT1** every 16 samples
-(watermark). The `sampler` task (`src/sampler.rs`) sleeps on that interrupt via async EXTI,
+The ADXL345 runs in **FIFO stream mode** (32-deep) at its **3200 Hz** max ODR (`BW_RATE`
+rate code `0x0F`; the rate the training data is decimated to) and raises **INT1** every 16
+samples (watermark). The `sampler` task (`src/sampler.rs`) sleeps on that interrupt via async EXTI,
 and only wakes to drain the buffered burst out over SPI — so the CPU is idle between
 watermarks instead of polling. Completed `[Sample; 512]` windows are handed to the inference
 loop in `main` over two `embassy_sync` channels (a free-buffer queue and a full-buffer
@@ -93,7 +97,7 @@ The `sim` feature (see `src/sim_source.rs`) reads `bearing_stream` from flash an
 deployed `bearing_cnn.bin`. The run reproduces the host gate exactly — UART shows
 `ALERT outer_race conf=<C>` (the latch) then `CLEAR` (the 3-normal-window hysteresis) then
 `sim stream complete`, where `C` matches `bearing_stream.ref.bin`'s PyTorch softmax: **1.000**
-for the fp32 build (`edge-pm.robot`) and **0.995** for the integer-only int8 build
+for the fp32 build (`edge-pm.robot`) and **0.996** for the integer-only int8 build
 (`edge-pm-q8.robot`). The int8 figure is computed entirely in integer arithmetic on the
 Cortex-M4F — float appears only at the final logit dequantize + softmax.
 

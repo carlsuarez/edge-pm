@@ -45,7 +45,7 @@ NORMAL_WINDOWS_TO_CLEAR = 3
 IMPULSE_PLAN = [False, False, True, True, False, False, False, False]
 
 OUTER_RACE = 2          # class index the z-kurtosis feature is wired to drive
-Z_KURT_FEATURE = 8      # feature index of axis-2 kurtosis in the 9-vector
+Z_KURT_FEATURE = 8      # feature index of axis-2 kurtosis (stats block, unchanged by bands)
 KURT_WEIGHT = 0.6       # dense weight on z-kurtosis -> outer_race logit
 NORMAL_BIAS = 2.5       # dense bias on normal: quiet kurtosis (~3) keeps normal on top
 
@@ -159,7 +159,7 @@ def main():
         write_quantized_model(q8_path, model, cfg, cal_windows, cal_feats)
         print(f"wrote {q8_path}  (int8 integer-only, v2)")
 
-    names = ["normal", "inner_race", "outer_race", "rolling_element"]
+    names = ["normal", "inner_race", "outer_race"]
     print(f"wrote {bin_path}")
     print(f"wrote {csv_path}  ({len(stream)} samples, {n_windows} windows)")
     print(f"wrote {ref_path}")

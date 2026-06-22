@@ -9,7 +9,7 @@
 //! that shrinks the time axis) and a `GlobalAveragePool` that collapses time to one value
 //! per channel. The pooled vector is then **concatenated with the 9 hand-crafted features**
 //! from [`crate::features`] and passed through a dense layer + softmax to a probability over
-//! the four [`Class`]es.
+//! the three [`Class`]es.
 //!
 //! Fusing the learned conv features with the classical statistical features (RMS, crest,
 //! kurtosis) is a common, defensible design for bearing diagnosis: the conv stack captures
@@ -33,7 +33,7 @@
 //!   → global_avg_pool      [c2]
 //!   → concat features      [c2 + FEATURE_LEN]
 //!   → dense (matmul+bias)  [N_CLASSES]
-//!   → softmax              [N_CLASSES]   (probabilities over the four classes)
+//!   → softmax              [N_CLASSES]   (probabilities over the three classes)
 //! ```
 //!
 //! # On-disk format
@@ -49,7 +49,7 @@ use crate::features::{Sample, FEATURE_LEN, N_AXES, WINDOW_LEN};
 use crate::RunState;
 
 /// Number of bearing-health classes the model discriminates.
-pub const N_CLASSES: usize = 4;
+pub const N_CLASSES: usize = 3;
 
 /// Magic at the head of an exported model: `"epm1"`.
 const MAGIC: [u8; 4] = *b"epm1";
@@ -72,8 +72,6 @@ pub enum Class {
     InnerRace,
     /// Outer-race fault.
     OuterRace,
-    /// Rolling-element fault.
-    RollingElement,
 }
 
 impl Class {
@@ -83,7 +81,6 @@ impl Class {
             0 => Class::Normal,
             1 => Class::InnerRace,
             2 => Class::OuterRace,
-            3 => Class::RollingElement,
             _ => return None,
         })
     }
@@ -94,7 +91,6 @@ impl Class {
             Class::Normal => "normal",
             Class::InnerRace => "inner_race",
             Class::OuterRace => "outer_race",
-            Class::RollingElement => "rolling_element",
         }
     }
 
@@ -374,7 +370,7 @@ fn rd_i32(b: &[u8], off: usize) -> i32 {
 }
 
 /// Run the forward pass: classify `window` + its `features` into the class **probabilities**
-/// (a softmax over the four [`Class`]es), written into `probs`.
+/// (a softmax over the three [`Class`]es), written into `probs`.
 ///
 /// Computes the result from the independent pieces — the [`ModelConfig`], the [`Weights`],
 /// and the [`RunState`] scratch — touching no memory beyond `state`'s arena-carved buffers
@@ -448,7 +444,7 @@ pub fn forward(
 /// [`QuantizedWeights::load`].
 ///
 /// The only floats touched anywhere near the model are the input/output boundaries: the
-/// window is quantized with `s_in0`, the fused features with `s_fc_in`, and the four final
+/// window is quantized with `s_in0`, the fused features with `s_fc_in`, and the three final
 /// `i32` logits are dequantized with `fc_out_scale` for the closing softmax.
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedWeights<'w> {
@@ -811,7 +807,7 @@ mod tests {
         assert_eq!(cfg.l1(), 253);
         assert_eq!(cfg.l2(), 125);
         // x + x_c1 + x_c2 + fc_in (no logits buffer: probs are a caller-owned out-param).
-        let expect = 3 * 512 + 16 * 253 + 32 * 125 + (32 + 9);
+        let expect = 3 * 512 + 16 * 253 + 32 * 125 + (32 + FEATURE_LEN);
         assert_eq!(cfg.buf_len(), expect);
     }
 
@@ -877,9 +873,9 @@ mod tests {
             s2: 1,
         };
         let mut w = vec![0.0f32; cfg.weight_floats()];
-        // Set only the dense bias (last N_CLASSES floats): [0, ln2, 0, 0].
+        // Set only the dense bias (last N_CLASSES floats): [0, ln2, 0].
         let n = w.len();
-        w[n - N_CLASSES..].copy_from_slice(&[0.0, core::f32::consts::LN_2, 0.0, 0.0]);
+        w[n - N_CLASSES..].copy_from_slice(&[0.0, core::f32::consts::LN_2, 0.0]);
         let blob = build_blob(&cfg, &w);
         let (config, weights) = Weights::load(&blob).unwrap();
 
@@ -887,11 +883,10 @@ mod tests {
         let feats = [1.0f32; FEATURE_LEN];
         let probs = run(&config, &weights, &window, &feats);
 
-        // softmax([0, ln2, 0, 0]) = [1, 2, 1, 1] / 5
-        assert!(close(probs[0], 0.2));
-        assert!(close(probs[1], 0.4));
-        assert!(close(probs[2], 0.2));
-        assert!(close(probs[3], 0.2));
+        // softmax([0, ln2, 0]) = [1, 2, 1] / 4
+        assert!(close(probs[0], 0.25));
+        assert!(close(probs[1], 0.5));
+        assert!(close(probs[2], 0.25));
     }
 
     #[test]

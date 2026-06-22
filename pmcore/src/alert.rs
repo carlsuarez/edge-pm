@@ -215,9 +215,9 @@ mod tests {
         );
         // A different fault now crosses the threshold: the latched class follows it.
         assert_eq!(
-            m.update(&probs(3, 0.85)),
+            m.update(&probs(2, 0.85)),
             State::Alert {
-                class: Class::RollingElement
+                class: Class::OuterRace
             }
         );
     }

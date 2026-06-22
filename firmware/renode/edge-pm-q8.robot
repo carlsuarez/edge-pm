@@ -35,10 +35,10 @@ Int8 Sim Stream Latches Then Clears An Alert
     Wait For Line On Uart     edge-pm: sim source (baked bearing_stream)
 
     # The integer-only forward pass classifies the impulsive windows as outer_race and latches.
-    # conf=0.995 is the softmax the host (`host-sim replay`) produced, reproduced on the
+    # conf=0.996 is the softmax the host (`host-sim replay`) produced, reproduced on the
     # Cortex-M4F purely in integer arithmetic (int8 weights+activations, i32 accumulation,
     # fixed-point requant) — float appears only at the final logit dequantize + softmax.
-    Wait For Line On Uart     ALERT outer_race conf=0.995    treatAsRegex=true
+    Wait For Line On Uart     ALERT outer_race conf=0.996    treatAsRegex=true
 
     # Three consecutive normal windows clear it (the AlertMachine hysteresis).
     Wait For Line On Uart     CLEAR

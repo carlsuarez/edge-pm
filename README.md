@@ -5,7 +5,7 @@ reads high-frequency vibration data from an **ADXL345** accelerometer over SPI +
 extracts signal features on-chip, and runs a small **1-D CNN** to classify bearing health in
 real time — no cloud, no WiFi, no OS, no heap in the hot path.
 
-Bearing-health classes: `0 normal · 1 inner_race · 2 outer_race · 3 rolling_element`.
+Bearing-health classes: `0 normal · 1 inner_race · 2 outer_race`.
 
 The same forward pass runs in **two numeric representations** from one source: fp32, and an
 **integer-only int8** build (int8 weights + activations, `i32` accumulation, fixed-point
@@ -28,7 +28,7 @@ places (laptop, emulator, real board):
 ```
         ┌──────────────────────────  pmcore (no_std core)  ──────────────────────────┐
  sample │  windowing       features::extract     model::forward        alert::Machine │
- stream │  512×[i16;3]  →   9 features        →   1-D CNN → softmax  →   NORMAL ⇄ ALERT│
+ stream │  512×[i16;3]  →  24 features        →   1-D CNN → softmax  →   NORMAL ⇄ ALERT│
         └────────────────────────────────────────────────────────────────────────────┘
               ▲                                                              │
    ADXL345 (firmware) · CSV file (host-sim) · baked blob (firmware sim)      ▼ LED + UART log
@@ -56,8 +56,8 @@ path runs in fp32 (`RunState<f32>`) or int8 (`RunState<i8>`). The int8 build is 
 integer-only** quantization: weights are int8 (per-output-channel scale), activations are
 int8 at calibration-fixed per-tensor scales, accumulation is `i32`, and each layer rescales
 with a fixed-point multiplier (`mult`·2^`shift`) — **no floating point between layers**.
-Float appears only at the boundaries: quantizing the input window and the 9 features going
-in, and dequantizing the four class logits for the closing softmax. (The dense layer's bias
+Float appears only at the boundaries: quantizing the input window and the 24 features going
+in, and dequantizing the three class logits for the closing softmax. (The dense layer's bias
 stays fp32 and is added *after* the final dequant, which keeps a zero-weight class exact.)
 
 Because the representation is fixed at build time, the firmware is `cfg`-gated on a `q8`
@@ -68,14 +68,15 @@ Measured footprint (release builds, `thumbv7em-none-eabihf`, via `size`):
 
 | | fp32 | int8 (`--features q8`) | |
 | --- | --- | --- | --- |
-| flash — code + rodata + model | **80.0 KB** | **74.9 KB** | of 512 KB |
-| static RAM — `bss` | **44.5 KB** | **16.4 KB** | of 128 KB |
-| └ forward-pass arena | 38.5 KB | 9.4 KB | (the int8 win) |
-| model weights (in flash) | 12,512 B | 3,748 B | **3.3× smaller** |
+| flash — code + rodata + model | **92.4 KB** | **87.0 KB** | of 512 KB |
+| static RAM — `bss` | **44.6 KB** | **16.4 KB** | of 128 KB |
+| └ forward-pass arena | 37.7 KB | 9.4 KB | (the int8 win) |
+| model weights (in flash) | 12,524 B | 3,744 B | **3.3× smaller** |
 
 The big RAM drop is the arena: an int8 working set is a quarter the size of the fp32 one. On
 the host the integer-only path tracks fp32 to ~3×10⁻³ absolute probability, and in Renode it
-reproduces the host decision exactly (`conf=0.995`, see below).
+reproduces the host decision exactly (`conf=0.996`, see below). (The spectral features added
+~13 KB of flash over the time-domain-only build — the FFT code plus the wider dense layer.)
 
 ---
 
@@ -85,7 +86,7 @@ reproduces the host decision exactly (`conf=0.995`, see below).
 edge-pm/
 ├── pmcore/                  no_std library — THE portable core (shared by host-sim + firmware)
 │   └── src/
-│       ├── features.rs        RMS / crest factor / kurtosis over a 512-sample window → [f32; 9]
+│       ├── features.rs        per-axis RMS/crest/kurtosis + log-spaced FFT bands over a 512-sample window → [f32; 24]
 │       ├── model.rs           1-D CNN: ModelConfig, zero-copy Weights/QuantizedWeights, `forward()` + `forward_q8()`
 │       ├── state.rs           RunState<T> — forward-pass activation buffers, carved from an Arena<T> (T = f32 or i8)
 │       ├── pipeline.rs        `process_window()` / `process_window_q8()` — the shared loop body
@@ -171,7 +172,7 @@ python tools/export_sim_stream.py                                         # blob
 
 ```sh
 cargo run -p host-sim                                          # print usage
-cargo run -p host-sim -- features models/bearing_cnn.window.csv          # Stage 2: the 9 features
+cargo run -p host-sim -- features models/bearing_cnn.window.csv          # Stage 2: the 24 features
 cargo run -p host-sim -- infer    models/bearing_cnn.bin models/bearing_cnn.window.csv   # +Stage 3: class probs
 cargo run -p host-sim -- infer    models/bearing_cnn_q8.bin models/bearing_cnn.window.csv # same, integer-only int8
 cargo run -p host-sim -- replay   models/bearing_stream.bin models/bearing_stream.csv    # Stages 1–4: windowing + alert FSM
@@ -193,13 +194,36 @@ firmware/renode/run.sh --test --q8      # headless robot test (int8)
 ```
 
 Expected UART: `boot → sim source → ALERT outer_race conf=<C> → CLEAR → sim stream complete`,
-where `C` is `1.000` for the fp32 build and `0.995` for the integer-only int8 build — the
+where `C` is `1.000` for the fp32 build and `0.996` for the integer-only int8 build — the
 same softmax the host produces, reproduced on the Cortex-M4F. See
 [`firmware/README.md`](firmware/README.md) for the manual Renode invocation and details.
 
 > `cargo run` is **not** the emulation path — the firmware's runner is `probe-rs`, which
 > flashes a real board. Build the hardware firmware (real ADXL345 over SPI) with:
 > `cd firmware && cargo build` (fp32) or `cargo build --features q8` (int8).
+
+### Training on real data — `tools/train_adxl355.py`
+
+The deployed model is trained on the **ADXL355 triaxial induction-motor dataset** (Mendeley
+DOI `10.17632/fm6xzxnf36.2`) — a MEMS triaxial accelerometer in the same family as the
+firmware's ADXL345, with `normal` / `inner_race` / `outer_race` recordings. Download the CSVs
+into `models/adxl355/` (gitignored), then:
+
+```sh
+python tools/train_adxl355.py --data models/adxl355 --out models/bearing.pt   # prints held-out acc + confusion
+python tools/export_model.py --checkpoint models/bearing.pt --out models/bearing_cnn.bin --quantize
+```
+
+> **Sampling-rate note.** The dataset's recordings are only 0.1 s, shorter than the 512-sample
+> window, so the loader decimates 10 kHz → **3200 Hz** (the ADXL345's max ODR, which the
+> firmware's `BW_RATE` matches) and overlap-windows per class. The `normal` class has only two
+> recordings, so it is data-starved and its held-out metric is weak — a documented limitation
+> of this (otherwise ideal sensor- and taxonomy-matched) short dataset. Training normalizes
+> inputs/features and folds the normalization back into the weights at export, so the deployed
+> model consumes raw counts + raw features and the Rust forward pass is unchanged.
+
+Without a checkpoint, `export_model.py` emits a deterministic random demo model — enough to
+exercise the no_std forward pass and the gates on a clean checkout.
 
 ### Tests & checks
 
@@ -233,7 +257,12 @@ cargo clippy --features sim,q8 -- -D warnings           #   sim int8
 | D   | Pipeline + decision state machine                   | `pmcore::{pipeline,alert}` | ✅ done (replay gate) |
 | E   | Firmware: embassy, SPI/DMA bring-up, real-time loop | `firmware/`                | ✅ done — **Renode-validated** |
 | F   | Int8 integer-only quantization (W8A8)               | `engine::nn`/`quant` + `pmcore` | ✅ done — host + on-target (Renode) |
+| G   | Spectral FFT features + 3-class taxonomy + real-data training | `engine::dsp` + `pmcore::features` + `tools/train_adxl355.py` | ✅ features + taxonomy done; training pipeline ready (ADXL355) |
 
 All planned milestones are complete. The fp32 and int8 paths are unified behind a single
 generic `RunState<T>` / `Arena<T>`, so there is one forward pass templated on the element
-type rather than two parallel implementations.
+type rather than two parallel implementations. Milestone G added per-axis log-spaced **FFT
+band features** (a Hann-windowed real FFT from `tiny-infer`'s `engine::dsp`, behind an
+opt-in `fft` feature) alongside the time-domain stats, narrowed the taxonomy to the three
+classes the real triaxial dataset provides, and wired the training pipeline that produces the
+deployed model.

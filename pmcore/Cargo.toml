@@ -11,7 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 # The tiny-infer inference engine (no_std, alloc-free), checked out beside this repo.
-engine = { path = "../../tiny-infer/engine" }
+# `fft` pulls in the real-FFT magnitude primitive the spectral band features use.
+engine = { path = "../../tiny-infer/engine", features = ["fft"] }
 # Transcendental fns `core` lacks (sqrtf for RMS, etc.) — same crate the engine uses.
 libm = "0.2.16"
 # Safe byte→f32 reinterpretation of the model's weight region (no_std).
