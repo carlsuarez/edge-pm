@@ -1,5 +1,5 @@
 //! Put `memory.x` on the linker search path so cortex-m-rt's `link.x` can include it.
-//! Standard cortex-m build script; active once the firmware shell is built (Milestone E).
+//! Standard cortex-m build script.
 
 use std::env;
 use std::fs::File;

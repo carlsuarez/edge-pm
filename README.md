@@ -10,8 +10,7 @@ Bearing-health classes: `0 normal · 1 inner_race · 2 outer_race`.
 The same forward pass runs in **two numeric representations** from one source: fp32, and an
 **integer-only int8** build (int8 weights + activations, `i32` accumulation, fixed-point
 requantization — no float between layers) that cuts static RAM by **2.7×** on the
-Cortex-M4F. Both are validated bit-for-bit against PyTorch on the host and on-target in
-emulation.
+Cortex-M4F. Both are validated bit-for-bit against PyTorch on the host.
 
 The number-crunching (conv / relu / pooling / matmul kernels, fp32 and int8) comes from the
 [`tiny-infer`](../tiny-infer) `engine` crate — a no_std, allocation-free kernel library
@@ -22,8 +21,7 @@ real-time pipeline, and the firmware.
 
 ## How it fits together
 
-One signal-processing pipeline, written once in a portable no_std library and run in three
-places (laptop, emulator, real board):
+One signal-processing pipeline, written once in a portable no_std library:
 
 ```
         ┌──────────────────────────  pmcore (no_std core)  ──────────────────────────┐
@@ -31,21 +29,18 @@ places (laptop, emulator, real board):
  stream │  512×[i16;3]  →  24 features        →   1-D CNN → softmax  →   NORMAL ⇄ ALERT│
         └────────────────────────────────────────────────────────────────────────────┘
               ▲                                                              │
-   ADXL345 (firmware) · CSV file (host-sim) · baked blob (firmware sim)      ▼ LED + UART log
+   ADXL345 over SPI + DMA (firmware)                                         ▼ LED + UART log
 ```
 
-**Host-first development.** Everything that isn't hardware is built and validated *on the
-laptop* against recorded/synthetic data before any board enters the picture. The portable
-logic lives in **`pmcore`**, which the host harness and the firmware share **unchanged** — so
-only the SPI/DMA bring-up is hardware-specific. The Python tools generate the models, the
-data, and the independent references each stage is checked against. The emulator for the
-hardware milestone is **Renode** (it models STM32F4 + SPI + DMA faithfully).
+**Portable core.** The signal-processing and inference logic lives in **`pmcore`**, a no_std
+library with no hardware dependencies, so it can be unit-tested on a laptop before it runs on
+the board — only the SPI/DMA bring-up is hardware-specific. The Python tools generate the
+model and the independent references each stage is checked against.
 
 **How a window arrives is the caller's job.** `pmcore` exposes `process_window()` — the
 `extract → forward → decide` step — but does not own the windowing: the firmware's `sampler`
 task drains the ADXL345 FIFO on each watermark interrupt and hands full `[Sample; 512]`
-buffers across an `embassy_sync` channel, while `host-sim` simply chops a recorded stream
-into 512-sample slices. Both feed the *same* `process_window()`.
+buffers across an `embassy_sync` channel into `process_window()`.
 
 ---
 
@@ -74,9 +69,9 @@ Measured footprint (release builds, `thumbv7em-none-eabihf`, via `size`):
 | model weights (in flash) | 12,524 B | 3,744 B | **3.3× smaller** |
 
 The big RAM drop is the arena: an int8 working set is a quarter the size of the fp32 one. On
-the host the integer-only path tracks fp32 to ~3×10⁻³ absolute probability, and in Renode it
-reproduces the host decision exactly (`conf=0.996`, see below). (The spectral features added
-~13 KB of flash over the time-domain-only build — the FFT code plus the wider dense layer.)
+the host the integer-only path tracks fp32 to ~3×10⁻³ absolute probability. (The spectral
+features added ~13 KB of flash over the time-domain-only build — the FFT code plus the wider
+dense layer.)
 
 ---
 
@@ -84,7 +79,7 @@ reproduces the host decision exactly (`conf=0.996`, see below). (The spectral fe
 
 ```
 edge-pm/
-├── pmcore/                  no_std library — THE portable core (shared by host-sim + firmware)
+├── pmcore/                  no_std library — THE portable core (used by the firmware)
 │   └── src/
 │       ├── features.rs        per-axis RMS/crest/kurtosis + log-spaced FFT bands over a 512-sample window → [f32; 24]
 │       ├── model.rs           1-D CNN: ModelConfig, zero-copy Weights/QuantizedWeights, `forward()` + `forward_q8()`
@@ -93,37 +88,22 @@ edge-pm/
 │       ├── alert.rs           AlertMachine — NORMAL ⇄ ALERT decision FSM with hysteresis
 │       └── lib.rs             crate root + re-exports (Arena, RunState)
 │
-├── host-sim/                std binary — runs pmcore on the laptop against CSV/fixture data
-│   ├── src/main.rs            `features` / `infer` / `replay` subcommands (auto-dispatch fp32 vs int8 by model version)
-│   └── tests/
-│       ├── infer.rs           gate: pmcore fp32 forward == PyTorch (Milestone C)
-│       ├── infer_q8.rs        gate: pmcore integer-only int8 forward == PyTorch (Milestone F)
-│       └── replay.rs          gate: pmcore probs == PyTorch AND alert FSM == Python (Milestone D)
-│
 ├── firmware/                no_std Cortex-M4F binary (embassy-stm32) — EXCLUDED from the workspace
 │   ├── src/
 │   │   ├── main.rs            embassy executor, peripheral init, the acquisition + inference loop
 │   │   ├── sampler.rs         hardware acquisition: ADXL345 FIFO + watermark interrupt → window channel
-│   │   ├── adxl345.rs         ADXL345 SPI driver (FIFO stream config + register/burst reads)
-│   │   └── sim_source.rs      flash-baked sample source (`--features sim`) — no sensor needed
-│   ├── renode/               emulation: see firmware/README.md
-│   │   ├── run.sh              build + run the sim firmware in Renode (`--q8` for the int8 build)
-│   │   ├── edge-pm.resc        Renode script: load the ELF, mirror UART to the console
-│   │   ├── edge-pm.robot       headless CI test (fp32 sim): assert the alert latch/clear trajectory
-│   │   ├── edge-pm-q8.robot    headless CI test (int8 sim): same trajectory, integer-only on-target
-│   │   └── stm32f411.repl      STM32F411 platform description
+│   │   └── adxl345.rs         ADXL345 SPI driver (FIFO stream config + register/burst reads)
 │   ├── memory.x / build.rs / .cargo/config.toml   linker layout, target, flash runner
-│   └── README.md             firmware + emulation deep-dive (pin map, embassy version notes)
+│   └── README.md             firmware deep-dive (pin map, embassy version notes)
 │
-├── tools/                   Python — generate models, data, and reference outputs (see below)
+├── tools/                   Python — generate the model and reference outputs (see below)
 ├── models/                  generated fixtures (GITIGNORED — recreate with the tools)
 └── README.md               (this file)
 ```
 
 > **Why `pmcore` exists.** The original spec put everything under `firmware/`. Pulling the
-> testable logic into a no_std library means feature extraction and inference can be unit-
-> tested and replayed on the host, instead of being trapped behind a hardware binary. The
-> firmware and host-sim then run *identical* code.
+> testable logic into a no_std library means feature extraction and inference can be
+> unit-tested on the host, instead of being trapped behind a hardware binary.
 
 ---
 
@@ -140,23 +120,14 @@ pip install -r tools/requirements.txt      # numpy, scipy, torch, pyserial
 
 | Script | What it does | Writes (in `models/`) | Consumed by |
 |--------|--------------|------------------------|-------------|
-| **export_model.py** | Builds/serializes the bearing 1-D CNN to the flat `epm1` weight format, plus one deterministic input window and the PyTorch reference (features + softmax). `--quantize` also writes the int8 v2 model. | `bearing_cnn.bin`, `bearing_cnn.window.csv`, `bearing_cnn.ref.bin` (+ `bearing_cnn_q8.bin`) | `host-sim infer`, `tests/infer.rs` / `tests/infer_q8.rs`, **firmware default/q8 builds** |
-| **make_stream.py** | Builds a *demo* model whose dense head is hand-wired so z-axis kurtosis drives `outer_race`, plus a multi-window sample stream that latches then clears an alert, plus the PyTorch probs + Python FSM trajectory. `--quantize` also writes the int8 v2 demo model. | `bearing_stream.bin` *(model!)*, `bearing_stream.csv` *(stream)*, `bearing_stream.ref.bin` (+ `bearing_stream_q8.bin`) | `host-sim replay`, `tests/replay.rs`, **firmware sim / sim+q8 builds** |
-| **export_sim_stream.py** | Converts `bearing_stream.csv` → a raw little-endian `i16` blob the firmware `include_bytes!`s. Pure stdlib (no numpy). | `bearing_stream.samples.bin` | **firmware `--features sim`** |
-| **verify_features.py** | numpy float64 reference for `pmcore::features` (RMS/crest/kurtosis). `--gen` also writes a deterministic test window. | (prints; `--gen` writes a CSV) | the Milestone B feature gate |
+| **export_model.py** | Builds/serializes the bearing 1-D CNN to the flat `epm1` weight format, plus one deterministic input window and the PyTorch reference (features + softmax). `--quantize` also writes the int8 v2 model. | `bearing_cnn.bin`, `bearing_cnn.window.csv`, `bearing_cnn.ref.bin` (+ `bearing_cnn_q8.bin`) | **firmware default/q8 builds** |
+| **verify_features.py** | numpy float64 reference for `pmcore::features` (RMS/crest/kurtosis). `--gen` also writes a deterministic test window. | (prints; `--gen` writes a CSV) | the feature-extraction reference |
 | **replay.py** | *Planned stub* — CWRU `.mat` ingestion (pack to a stream / stream over UART). Prints "not yet implemented". | — | — (future) |
 
-> **Naming gotcha:** `make_stream.py` writes `bearing_stream.bin` — that is the **model**,
-> not the data. The data stream is `bearing_stream.csv`. (`export_model.py`'s
-> `bearing_cnn.bin` is a *different*, randomly-initialized model used only for the
-> numeric-parity gate; it does not alert.)
-
-**Regenerate every fixture** (run from the repo root, venv active):
+**Regenerate the model fixtures** (run from the repo root, venv active):
 
 ```sh
-python tools/export_model.py  --out models/bearing_cnn.bin --quantize     # infer gates + default/q8 firmware
-python tools/make_stream.py   --out models/bearing_stream  --quantize     # replay gate + sim/sim+q8 firmware
-python tools/export_sim_stream.py                                         # blob for the sim firmware
+python tools/export_model.py  --out models/bearing_cnn.bin --quantize     # default/q8 firmware
 ```
 
 ---
@@ -168,39 +139,18 @@ python tools/export_sim_stream.py                                         # blob
 > `../../tiny-infer/engine`). For the embedded targets:
 > `rustup target add thumbv7em-none-eabi thumbv7em-none-eabihf`.
 
-### Host simulator — `host-sim` (run pmcore on the laptop)
+### Firmware — build & flash
+
+The firmware's runner is `probe-rs`, which flashes a real board over a debug probe. Build the
+firmware (real ADXL345 over SPI) with:
 
 ```sh
-cargo run -p host-sim                                          # print usage
-cargo run -p host-sim -- features models/bearing_cnn.window.csv          # Stage 2: the 24 features
-cargo run -p host-sim -- infer    models/bearing_cnn.bin models/bearing_cnn.window.csv   # +Stage 3: class probs
-cargo run -p host-sim -- infer    models/bearing_cnn_q8.bin models/bearing_cnn.window.csv # same, integer-only int8
-cargo run -p host-sim -- replay   models/bearing_stream.bin models/bearing_stream.csv    # Stages 1–4: windowing + alert FSM
-#   `infer` / `replay` auto-detect fp32 (v1) vs int8 (v2) from the model header.
-#   add: --alert-confidence <f>   to override the 0.80 threshold in `replay`
+cd firmware && cargo build              # fp32
+cargo build --features q8               # integer-only int8
+cargo run                               # flash + run on a connected board (probe-rs)
 ```
 
-### Firmware in emulation — `--features sim` + Renode
-
-The sim build swaps the ADXL345 for the baked `bearing_stream` blob, so the whole pipeline +
-UART log runs with no sensor model. `run.sh` builds and launches Renode for you (it expects
-`renode` and `renode-test` on `PATH`):
-
-```sh
-firmware/renode/run.sh                  # fp32 sim: build + boot + print the UART log, then exit
-firmware/renode/run.sh --q8             # int8 sim: the integer-only build, same trajectory
-firmware/renode/run.sh --test           # headless robot test (fp32, asserts latch/clear)
-firmware/renode/run.sh --test --q8      # headless robot test (int8)
-```
-
-Expected UART: `boot → sim source → ALERT outer_race conf=<C> → CLEAR → sim stream complete`,
-where `C` is `1.000` for the fp32 build and `0.996` for the integer-only int8 build — the
-same softmax the host produces, reproduced on the Cortex-M4F. See
-[`firmware/README.md`](firmware/README.md) for the manual Renode invocation and details.
-
-> `cargo run` is **not** the emulation path — the firmware's runner is `probe-rs`, which
-> flashes a real board. Build the hardware firmware (real ADXL345 over SPI) with:
-> `cd firmware && cargo build` (fp32) or `cargo build --features q8` (int8).
+See [`firmware/README.md`](firmware/README.md) for the pin map and embassy version notes.
 
 ### Training on real data — `tools/train_adxl355.py`
 
@@ -223,46 +173,28 @@ python tools/export_model.py --checkpoint models/bearing.pt --out models/bearing
 > model consumes raw counts + raw features and the Rust forward pass is unchanged.
 
 Without a checkpoint, `export_model.py` emits a deterministic random demo model — enough to
-exercise the no_std forward pass and the gates on a clean checkout.
+exercise the no_std forward pass on a clean checkout.
 
 ### Tests & checks
 
 ```sh
-cargo test                                              # host: pmcore unit tests + host-sim gates
+cargo test                                              # host: pmcore unit tests
 cargo clippy --all-targets -- -D warnings               # host lints
 cargo build -p pmcore --target thumbv7em-none-eabi      # prove pmcore stays no_std
 
-cd firmware                                             # all four configs lint clean:
-cargo clippy -- -D warnings                             #   hardware fp32
-cargo clippy --features q8 -- -D warnings               #   hardware int8
-cargo clippy --features sim -- -D warnings              #   sim fp32
-cargo clippy --features sim,q8 -- -D warnings           #   sim int8
+cd firmware                                             # both firmware configs lint clean:
+cargo clippy -- -D warnings                             #   fp32
+cargo clippy --features q8 -- -D warnings               #   int8
 ```
-
-> The `host-sim` gates (`tests/infer.rs`, `tests/infer_q8.rs`, `tests/replay.rs`) read
-> fixtures from `models/` and **skip cleanly if they're absent** — generate them with the
-> tools above to run them. The firmware robot tests (`run.sh --test [--q8]`) need
-> `robotframework` etc. — install them from your Renode install's `tests/requirements.txt`
-> (`pip install --user -r <renode>/tests/requirements.txt`).
 
 ---
 
-## Roadmap (host-first order)
+## Architecture notes
 
-| #   | Milestone                                           | Where                      | Status |
-| --- | --------------------------------------------------- | -------------------------- | ------ |
-| A   | CNN ops (`conv1d`/`relu`/`global_avg_pool`)         | `tiny-infer` `engine::nn`  | ✅ done |
-| B   | Feature extraction (RMS, crest, kurtosis)           | `pmcore::features`         | ✅ done (vs `verify_features.py`) |
-| C   | Model format + loader + forward pass                | `pmcore::model`            | ✅ done (bit-identical to PyTorch) |
-| D   | Pipeline + decision state machine                   | `pmcore::{pipeline,alert}` | ✅ done (replay gate) |
-| E   | Firmware: embassy, SPI/DMA bring-up, real-time loop | `firmware/`                | ✅ done — **Renode-validated** |
-| F   | Int8 integer-only quantization (W8A8)               | `engine::nn`/`quant` + `pmcore` | ✅ done — host + on-target (Renode) |
-| G   | Spectral FFT features + 3-class taxonomy + real-data training | `engine::dsp` + `pmcore::features` + `tools/train_adxl355.py` | ✅ features + taxonomy done; training pipeline ready (ADXL355) |
-
-All planned milestones are complete. The fp32 and int8 paths are unified behind a single
-generic `RunState<T>` / `Arena<T>`, so there is one forward pass templated on the element
-type rather than two parallel implementations. Milestone G added per-axis log-spaced **FFT
-band features** (a Hann-windowed real FFT from `tiny-infer`'s `engine::dsp`, behind an
-opt-in `fft` feature) alongside the time-domain stats, narrowed the taxonomy to the three
-classes the real triaxial dataset provides, and wired the training pipeline that produces the
-deployed model.
+The fp32 and int8 paths are unified behind a single generic `RunState<T>` / `Arena<T>`, so
+there is one forward pass templated on the element type rather than two parallel
+implementations. Feature extraction runs per-axis log-spaced **FFT band features** (a
+Hann-windowed real FFT from `tiny-infer`'s `engine::dsp`, behind an opt-in `fft` feature)
+alongside the time-domain RMS/crest/kurtosis stats. The taxonomy is the three classes the
+real triaxial dataset provides (`normal` / `inner_race` / `outer_race`), and
+`tools/train_adxl355.py` is the training pipeline that produces the deployed model.

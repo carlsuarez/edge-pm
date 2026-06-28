@@ -1,11 +1,9 @@
 //! # pmcore
 //!
 //! The portable, `no_std`, allocation-free core of the edge-pm predictive-maintenance
-//! node. Everything here runs **identically** on the host (driven by [`host-sim`] over
-//! recorded data) and on the STM32F411 firmware — the only difference is who feeds it
-//! samples. Keeping the signal-processing and inference logic in this shared library is
-//! what lets the whole pipeline be developed and unit-tested on a laptop before any
-//! board, real or emulated, is involved.
+//! node. The STM32F411 firmware feeds it samples; keeping the signal-processing and
+//! inference logic in this library is what lets the whole pipeline be developed and
+//! unit-tested on a laptop before it runs on the board.
 //!
 //! The four stages of the pipeline map to the four modules:
 //!
@@ -19,8 +17,6 @@
 //!
 //! Allocation-free throughout: every working buffer is caller-provided (on-device, carved
 //! once from a static [`engine::Arena`]; on the host, a plain stack/heap buffer).
-//!
-//! [`host-sim`]: ../host_sim/index.html
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]

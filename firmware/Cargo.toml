@@ -1,4 +1,4 @@
-# edge-pm firmware: ADXL345 acquisition + on-device 1-D CNN inference (STM32F411RE).
+# edge-pm firmware: ADXL345 acquisition + on-device 1-D CNN inference (STM32F411CE).
 #
 # Excluded from the host workspace (own compile target + linker script — see the root
 # Cargo.toml), so version/edition are explicit (excluded crates can't inherit
@@ -18,34 +18,34 @@ test = false
 bench = false
 
 [features]
-# Emulation/CI build: replaces the ADXL345 FIFO source with a flash-baked sample stream so
-# the pipeline + alert FSM + UART log can run in Renode with no sensor model. See
-# `src/sim_source.rs` and `renode/`.
-sim = []
-
 # Int8 (integer-only) build: bakes the quantized v2 checkpoint and runs `process_window_q8`
-# (the Milestone-F stretch). Orthogonal to `sim` — combine `--features sim,q8` for the Renode
-# int8 demo, or `--features q8` for the hardware int8 build. See `pmcore::model::forward_q8`.
+# instead of the fp32 path. See `pmcore::model::forward_q8`.
 q8 = []
 
 [dependencies]
 pmcore = { path = "../pmcore" }
+adxl345-async = { path = "../../adxl345-async" }
 
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
-panic-halt = "0.2"
 
 embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
 embassy-stm32 = { version = "0.6", features = [
-    "stm32f411re",
+    "stm32f411ce",
     "time-driver-any",
     "exti",
 ] }
 embassy-time = "0.4"
 
 static_cell = "2"
-heapless = "0.8"
 embassy-sync = "0.8.0"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+
+# Logging over the ST-Link probe: defmt log frames are shipped off-chip via RTT (defmt-rtt)
+# and printed by the probe-rs runner; panics print the same way through panic-probe.
+defmt = "1.1.0"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
 
 [profile.dev]
 opt-level = "s"        # the engine's f32 kernels are unbearable at -O0 even in dev
@@ -55,5 +55,5 @@ debug = true
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-debug = true
+debug = false
 panic = "abort"

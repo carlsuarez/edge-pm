@@ -22,8 +22,7 @@
 //! grouped by axis. The split keeps the original 9 stat values at the same indices.
 //!
 //! The definitions here mirror `tools/verify_features.py` exactly, so the firmware's
-//! `extract` and that numpy reference agree to `f32` tolerance on identical input — the
-//! Milestone B correctness gate.
+//! `extract` and that numpy reference agree to `f32` tolerance on identical input.
 
 use engine::dsp;
 

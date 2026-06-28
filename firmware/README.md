@@ -2,15 +2,10 @@
 
 The hardware application: an `embassy-stm32` async executor brings up the ADXL345 over
 SPI2 + DMA, and the real-time loop drives [`pmcore`](../pmcore)'s `features → model → alert`
-pipeline, the on-board alert LED, and a UART2 debug log. It runs the **same** `pmcore` code
-the host simulator proved out — only the sample source differs (a real accelerometer here, a
-CSV file in `host-sim`).
+pipeline, the on-board alert LED, and a UART2 debug log.
 
-**Status: Renode-validated, fp32 + int8.** Builds for `thumbv7em-none-eabihf` (dev +
-release), all four configs clippy clean, fits the chip with room to spare, and the
-`--features sim` builds boot in **Renode** emulation and reproduce the host gate's alert
-trajectory on the real Cortex-M4F ISA — in both fp32 and integer-only int8 (see
-[Emulation](#emulation-renode)).
+**Status: fp32 + int8.** Builds for `thumbv7em-none-eabihf` (dev + release), both configs
+clippy clean, and fits the chip with room to spare.
 
 Measured release footprint (`size`):
 
@@ -29,7 +24,7 @@ the earlier time-domain-only build: `pmcore::features` now also runs a Hann-wind
 per axis — from `tiny-infer`'s `engine::dsp` — for the log-spaced spectral band features, and
 the dense layer widened with them. The FFT scratch is on the stack, so `bss` is unchanged.)
 
-## Acquisition (hardware build)
+## Acquisition
 
 The ADXL345 runs in **FIFO stream mode** (32-deep) at its **3200 Hz** max ODR (`BW_RATE`
 rate code `0x0F`; the rate the training data is decimated to) and raises **INT1** every 16
@@ -62,61 +57,11 @@ test fixtures) — or `bearing_cnn_q8.bin` for the `q8` build — so generate it
 (`--quantize` writes both). Its layer dimensions must match the `CFG` constant in
 `src/main.rs`; the boot code asserts this against the loaded header.
 
-## Emulation (Renode)
-
-Renode has no SPI ADXL345 model (its `Sensors.ADXL345` is I2C-only), so the emulation build
-swaps the sensor for a flash-baked sample stream instead of faking the SPI wire protocol:
-
-```sh
-python ../tools/make_stream.py --out ../models/bearing_stream --quantize   # demo model(s) + stream + ref
-python ../tools/export_sim_stream.py                                       # stream -> .samples.bin blob
-
-renode/run.sh          # fp32 sim: build (--features sim) + boot in Renode + print the UART log
-renode/run.sh --q8     # int8 sim: the integer-only build
-renode/run.sh --test   # headless robot test (fp32; --q8 for int8)
-```
-
-`run.sh` assumes `renode` and `renode-test` are on `PATH`. **Note:** `cargo run` is *not* the
-emulation path — the `.cargo/config.toml` runner is `probe-rs`, which flashes a real board;
-Renode loads the ELF directly, which is what `run.sh` does. To drive Renode by hand instead:
-
-```sh
-cargo build --features sim                                 # (or --features sim,q8)
-renode-test renode/edge-pm.robot                          # headless CI test (edge-pm-q8.robot for int8)
-renode --console -e 'include @renode/edge-pm.resc; start' # interactive (in a TTY)
-```
-
-> **Gotcha:** the robots `LoadELF` the **debug** ELF (`target/thumbv7em-none-eabihf/debug/`),
-> not release. After changing the firmware, rebuild the matching debug ELF
-> (`cargo build --features sim[,q8]`, no `--release`) before `renode-test`, or it silently
-> runs a stale binary. `run.sh` builds the right one for you.
-
-The `sim` feature (see `src/sim_source.rs`) reads `bearing_stream` from flash and drives the
-**same** `windowing → features → CNN → alert` pipeline and UART log; it bakes the
-`bearing_stream` demo model (whose hand-wired head latches `outer_race`) rather than the
-deployed `bearing_cnn.bin`. The run reproduces the host gate exactly — UART shows
-`ALERT outer_race conf=<C>` (the latch) then `CLEAR` (the 3-normal-window hysteresis) then
-`sim stream complete`, where `C` matches `bearing_stream.ref.bin`'s PyTorch softmax: **1.000**
-for the fp32 build (`edge-pm.robot`) and **0.996** for the integer-only int8 build
-(`edge-pm-q8.robot`). The int8 figure is computed entirely in integer arithmetic on the
-Cortex-M4F — float appears only at the final logit dequantize + softmax.
-
-This validates the on-target compute + control flow + UART; the ADXL345 SPI/DMA driver and
-the FIFO/watermark acquisition path are build-checked and exercised on real hardware (Renode
-has no ADXL345 SPI model and cannot toggle INT1; the boot `device_id()` DMA read does work
-against a `Sensors.GenericSPISensor` stub, which is how the SPI path was smoke-tested).
-
 ## Files
 
-- `src/main.rs`        — embassy executor, peripheral init, the acquisition + inference loop (cfg-split: hardware / `sim`, fp32 / `q8`)
+- `src/main.rs`        — embassy executor, peripheral init, the acquisition + inference loop (cfg-split: fp32 / `q8`)
 - `src/sampler.rs`     — hardware acquisition task: ADXL345 FIFO + watermark interrupt → window channel
 - `src/adxl345.rs`     — ADXL345 SPI driver (FIFO stream config + register/burst reads)
-- `src/sim_source.rs`  — flash-baked `bearing_stream` source for the `--features sim` build
-- `renode/run.sh`         — build the sim ELF + run it in Renode (`--test` robot test, `--q8` int8 build)
-- `renode/stm32f411.repl` — F411 platform (specialises Renode's bundled STM32F4 description)
-- `renode/edge-pm.resc`   — load + run the sim ELF, mirror USART2 to the console
-- `renode/edge-pm.robot`  — CI test (fp32 sim): boot the ELF and assert the alert latch/clear log
-- `renode/edge-pm-q8.robot` — CI test (int8 sim): same trajectory, integer-only on-target
 - `memory.x`           — STM32F411RE linker layout (512K flash / 128K SRAM)
 - `build.rs`           — puts `memory.x` on the linker search path
 - `.cargo/config.toml` — target, linker args, flash/run runner
@@ -131,10 +76,8 @@ pulled transitively). Gotchas, all linker/build errors otherwise:
   DMA channels and require the **DMA stream** interrupts bound too (not just USART2) — see the
   `bind_interrupts!` block. In stm32 0.6 `Spi` also takes two generics (`Spi<'d, Async, Master>`).
 - Async EXTI is bound manually too: `EXTI1 => exti::InterruptHandler<..::EXTI1>` in
-  `bind_interrupts!` (cfg-gated to the hardware build, alongside the SPI DMA stream IRQs).
+  `bind_interrupts!`, alongside the SPI DMA stream IRQs.
 - embassy-time's integrated timer queue needs `__embassy_time_queue_item_from_waker`, which is
   only provided by **embassy-executor ≥ 0.9** (it owns the split-out `embassy-executor-timer-queue`
   crate). 0.7 predates the split and fails to link. 0.9 also dropped the `task-arena-size-*`
   feature (tasks are statically sized now).
-- Renode's STM32 UART model does **not** raise the TX DMA transfer-complete interrupt, so
-  `uart.write().await` (DMA) hangs forever — the log path uses `uart.blocking_write` instead.

@@ -7,7 +7,7 @@
 //! single noisy window from flapping the alert. In firmware the state drives the LED blink
 //! pattern and the UART log line; here the logic is platform-agnostic and host-testable.
 //!
-//! The transitions (Milestone D) are driven one window at a time by
+//! The transitions are driven one window at a time by
 //! [`AlertMachine::update`]; [`crate::pipeline::process_window`] feeds it the model output.
 
 use crate::model::{Class, N_CLASSES};

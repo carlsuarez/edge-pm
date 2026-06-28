@@ -1,10 +1,24 @@
-# Milestone E firmware build config. Cortex-M4F → the hard-float (`eabihf`) ABI so the
+# Firmware build config. Cortex-M4F → the hard-float (`eabihf`) ABI so the
 # FPU is used. Add the target before building: `rustup target add thumbv7em-none-eabihf`.
 [build]
 target = "thumbv7em-none-eabihf"
 
+# defmt filters log macros at COMPILE time via DEFMT_LOG; if it is unset/too high, `info!`
+# lines compile to no-ops and only panics print. Pin it to `debug` so the boot/alert log lines
+# are always emitted over RTT. Override per-run with `DEFMT_LOG=trace cargo run`, etc.
+[env]
+DEFMT_LOG = "debug"
+
 [target.thumbv7em-none-eabihf]
-# Link against the cortex-m-rt linker script (`link.x`), which pulls in `memory.x`.
-rustflags = ["-C", "link-arg=-Tlink.x"]
-# Flash/run on real hardware (Milestone E); Renode runs the ELF directly instead.
-runner = "probe-rs run --chip STM32F411RETx"
+# link.x: cortex-m-rt's linker script (pulls in memory.x). defmt.x: places the defmt log
+# string table so the RTT frames can be decoded by the host.
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tdefmt.x",
+]
+# `probe-rs run` flashes the ELF over SWD and streams the defmt-rtt logs back through the
+# ST-Link — `cargo run` both flashes and prints the log. --connect-under-reset: the firmware
+# idles the core in WFE while awaiting the watermark interrupt, and a sleeping core makes the
+# ST-Link's SWD accesses return WAIT (SwdDpWait), locking out a normal attach. Connecting under
+# reset halts the core at the reset vector first, so flash + RTT attach reliably.
+runner = "probe-rs run --chip STM32F411CEUx --connect-under-reset"

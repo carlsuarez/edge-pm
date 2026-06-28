@@ -1,12 +1,10 @@
-//! Stage 1 glue — the per-window pipeline step shared by `host-sim` and the firmware.
+//! Stage 1 glue — the per-window pipeline step the firmware drives.
 //!
-//! How a completed window arrives is platform-specific and lives in the caller:
-//! - the firmware's `sampler` task drains the ADXL345 FIFO on each watermark interrupt and
-//!   hands full windows across an `embassy_sync` channel,
-//! - `host-sim` chops a recorded sample stream into
-//!   [`WINDOW_LEN`](crate::features::WINDOW_LEN)-long slices.
+//! How a completed window arrives lives in the caller: the firmware's `sampler` task drains
+//! the ADXL345 FIFO on each watermark interrupt and hands full windows across an
+//! `embassy_sync` channel.
 //!
-//! Once a window exists, both feed it through [`process_window`] — the end-to-end
+//! Once a window exists, it is fed through [`process_window`] — the end-to-end
 //! `extract → forward → decide` step — so the wiring between the four stages exists in
 //! exactly one place.
 
