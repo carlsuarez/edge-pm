@@ -26,22 +26,26 @@ the dense layer widened with them. The FFT scratch is on the stack, so `bss` is 
 
 ## Acquisition
 
-The ADXL345 runs in **FIFO stream mode** (32-deep) at its **3200 Hz** max ODR (`BW_RATE`
-rate code `0x0F`; the rate the training data is decimated to) and raises **INT1** every 16
-samples (watermark). The `sampler` task (`src/sampler.rs`) sleeps on that interrupt via async EXTI,
-and only wakes to drain the buffered burst out over SPI — so the CPU is idle between
-watermarks instead of polling. Completed `[Sample; 512]` windows are handed to the inference
-loop in `main` over two `embassy_sync` channels (a free-buffer queue and a full-buffer
-queue), which double-buffers acquisition against inference with no shared mutable state.
+The ADXL345 is driven by the external [`adxl345-async`](../../adxl345-async) crate — a no_std,
+async-first driver that owns the FIFO-stream config and the watermark-interrupt burst-read
+path. It runs in **FIFO stream mode** (32-deep) at the **3200 Hz** max ODR (`BW_RATE` rate
+code `0x0F`; the rate the training data is decimated to) and raises its **watermark
+interrupt** every 16 samples. The `sampler` task (`src/sampler.rs`) sleeps on that interrupt
+via async EXTI and only wakes to drain the buffered burst over SPI — so the CPU is idle
+between watermarks instead of polling. The driver yields each reading as an `Accel`, which the
+task transcribes into pmcore's `Sample` (`[i16; 3]`) as it fills a window. Completed
+`[Sample; 512]` windows are handed to the inference loop in `main` over two `embassy_sync`
+channels (a free-buffer queue and a full-buffer queue), which double-buffers acquisition
+against inference with no shared mutable state.
 
-## Pin map (Nucleo-F411RE)
+## Pin map (Black Pill STM32F411CEU6)
 
-- **LD2 alert LED** — PA5
-- **USART2 debug log** — PA2 (TX) / PA3 (RX), DMA1 streams 6/5
+- **alert LED** — PC13 (active-low — the on-board LED sinks to the pin)
+- **debug log** — RTT over SWD (PA13 SWDIO / PA14 SWCLK), printed by `probe-rs run`; no UART
 - **ADXL345 over SPI2** — PB13 (SCK) / PB15 (MOSI) / PB14 (MISO), CS PB12, DMA1 streams 4/3
-- **ADXL345 INT1** — PB1 (EXTI1), active-high FIFO watermark
+- **ADXL345 watermark INT** — PB1 (EXTI1), active-high (routed from the sensor's INT2 in `main.rs`)
 
-SPI2 rather than SPI1 because SPI1's SCK is PA5 — the on-board LED — on this board.
+SPI2 rather than SPI1 because SPI1's SCK is PA5.
 
 ## Build
 
@@ -60,9 +64,8 @@ test fixtures) — or `bearing_cnn_q8.bin` for the `q8` build — so generate it
 ## Files
 
 - `src/main.rs`        — embassy executor, peripheral init, the acquisition + inference loop (cfg-split: fp32 / `q8`)
-- `src/sampler.rs`     — hardware acquisition task: ADXL345 FIFO + watermark interrupt → window channel
-- `src/adxl345.rs`     — ADXL345 SPI driver (FIFO stream config + register/burst reads)
-- `memory.x`           — STM32F411RE linker layout (512K flash / 128K SRAM)
+- `src/sampler.rs`     — hardware acquisition task: drains the FIFO via the `adxl345-async` driver on each watermark interrupt → window channel
+- `memory.x`           — STM32F411CE linker layout (512K flash / 128K SRAM)
 - `build.rs`           — puts `memory.x` on the linker search path
 - `.cargo/config.toml` — target, linker args, flash/run runner
 
@@ -72,8 +75,8 @@ Getting a self-consistent embassy set is fiddly. The working combination is **em
 0.6** + **embassy-executor 0.9** + **embassy-time 0.4** (+ `embassy-time-queue-utils` 0.3,
 pulled transitively). Gotchas, all linker/build errors otherwise:
 
-- The async (DMA) `Uart::new` / `Spi::new` take their interrupt-binding argument *after* the
-  DMA channels and require the **DMA stream** interrupts bound too (not just USART2) — see the
+- The async (DMA) `Spi::new` takes its interrupt-binding argument *after* the DMA channels and
+  requires the **DMA stream** interrupts bound (DMA1 streams 4/3 for SPI2) — see the
   `bind_interrupts!` block. In stm32 0.6 `Spi` also takes two generics (`Spi<'d, Async, Master>`).
 - Async EXTI is bound manually too: `EXTI1 => exti::InterruptHandler<..::EXTI1>` in
   `bind_interrupts!`, alongside the SPI DMA stream IRQs.

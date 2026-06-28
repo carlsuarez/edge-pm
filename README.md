@@ -1,7 +1,7 @@
 # edge-pm — on-device predictive-maintenance sensor node
 
-A self-contained Rust firmware application for the **STM32F411 Nucleo** (Cortex-M4F) that
-reads high-frequency vibration data from an **ADXL345** accelerometer over SPI + DMA,
+A self-contained Rust firmware application for the **STM32F411CE "Black Pill"** (Cortex-M4F)
+that reads high-frequency vibration data from an **ADXL345** accelerometer over SPI + DMA,
 extracts signal features on-chip, and runs a small **1-D CNN** to classify bearing health in
 real time — no cloud, no WiFi, no OS, no heap in the hot path.
 
@@ -91,8 +91,8 @@ edge-pm/
 ├── firmware/                no_std Cortex-M4F binary (embassy-stm32) — EXCLUDED from the workspace
 │   ├── src/
 │   │   ├── main.rs            embassy executor, peripheral init, the acquisition + inference loop
-│   │   ├── sampler.rs         hardware acquisition: ADXL345 FIFO + watermark interrupt → window channel
-│   │   └── adxl345.rs         ADXL345 SPI driver (FIFO stream config + register/burst reads)
+│   │   └── sampler.rs         hardware acquisition: drains the FIFO via the `adxl345-async`
+│   │                          driver on each watermark interrupt → window channel
 │   ├── memory.x / build.rs / .cargo/config.toml   linker layout, target, flash runner
 │   └── README.md             firmware deep-dive (pin map, embassy version notes)
 │
@@ -134,9 +134,10 @@ python tools/export_model.py  --out models/bearing_cnn.bin --quantize     # defa
 
 ## Commands
 
-> Prerequisites: Rust **stable** (`rust-toolchain.toml` pins it) and
-> [`tiny-infer`](../tiny-infer) checked out **beside** this repo (`pmcore` depends on
-> `../../tiny-infer/engine`). For the embedded targets:
+> Prerequisites: Rust **stable** (`rust-toolchain.toml` pins it) and two sibling crates
+> checked out **beside** this repo: [`tiny-infer`](../tiny-infer) (`pmcore` depends on
+> `../../tiny-infer/engine`) and [`adxl345-async`](../adxl345-async) (the firmware's ADXL345
+> driver, at `../../adxl345-async`). For the embedded targets:
 > `rustup target add thumbv7em-none-eabi thumbv7em-none-eabihf`.
 
 ### Firmware — build & flash
